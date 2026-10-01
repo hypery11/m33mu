@@ -8,6 +8,8 @@
 #include <sys/random.h>
 #include "rp2350/cpu_config.h"
 #include "rp2350/rp2350_mmio.h"
+#include "rp2350/rp2350_extra.h"
+#include "rp2350/rp2350_dma.h"
 #include "rp2350/rp2350_pio.h"
 #include "rp2350/rp2350_usb.h"
 #include "rp2350/rp2350_coproc.h"
@@ -31,7 +33,7 @@ extern void mm_system_request_reset(void);
 #define PADS_QSPI_BASE  0x40040000u
 #define PADS_QSPI_SIZE  0x1000u
 #define PSM_BASE 0x40018000u
-#define PSM_SIZE 0x10u
+#define PSM_SIZE 0x4000u /* with atomic XOR/SET/CLR aliases */
 #define XOSC_BASE 0x40048000u
 #define XOSC_SIZE 0x1000u
 #define PLL_SYS_BASE 0x40050000u
@@ -1199,6 +1201,22 @@ mm_u32 mm_rp2350_gpio_funcsel(mm_u32 pin)
     return io_bank0.regs[off / 4u] & 0x1fu;
 }
 
+/* IO_BANK0 GPIOn_CTRL OEOVER/OUTOVER (0 normal, 1 invert, 2 low, 3 high) as
+ * per-pin masks, so pad levels honour gpio_set_oeover()/gpio_set_outover(). */
+void mm_rp2350_gpio_overrides(mm_u64 masks[6])
+{
+    mm_u32 pin;
+    mm_u32 k;
+    for (k = 0; k < 6u; ++k) masks[k] = 0u;
+    for (pin = 0; pin < 48u; ++pin) {
+        mm_u32 ctrl = io_bank0.regs[(pin * 8u + 4u) / 4u];
+        mm_u32 outover = (ctrl >> 12) & 3u;
+        mm_u32 oeover = (ctrl >> 14) & 3u;
+        if (oeover != 0u) masks[oeover - 1u] |= 1ull << pin;      /* 0 inv,1 low,2 high */
+        if (outover != 0u) masks[3u + outover - 1u] |= 1ull << pin; /* 3 inv,4 low,5 high */
+    }
+}
+
 /* Pads driven by SIO, for the PIO model to fold into its input view. */
 void mm_rp2350_sio_pad_state(mm_u32 *out_lo, mm_u32 *out_hi, mm_u32 *oe_lo, mm_u32 *oe_hi)
 {
@@ -1317,10 +1335,24 @@ static mm_bool rp2350_gpio_set_external_input_cb(void *opaque, int bank, int pin
     return MM_TRUE;
 }
 
+/* Pad pull-ups (PADS_BANK0 GPIOn.PUE): an undriven pin with a pull-up reads 1,
+ * anything else undriven reads 0 (pull-down or floating). */
+mm_u64 mm_rp2350_pad_pullups(void)
+{
+    mm_u64 pu = 0u;
+    mm_u32 pin;
+    for (pin = 0; pin < 48u; ++pin) {
+        mm_u32 v = pads_bank0.regs[(4u + 4u * pin) / 4u];
+        if ((v & (1u << 3)) != 0u) pu |= 1ull << pin;
+    }
+    return pu;
+}
+
 /*
  * Pads are shared between SIO and the PIO blocks: a PIO wins on any pin it
  * drives and whose function select points at it. An undriven pin reads what
- * an external circuit drives on it; without one it reads back SIO OUT.
+ * an external circuit drives on it; without one it reads its pad pull-up
+ * (1) or 0 (pull-down or floating).
  */
 static void sio_sync_inputs(void)
 {
@@ -1328,17 +1360,24 @@ static void sio_sync_inputs(void)
     mm_u32 pio_hi = 0u;
     mm_u32 oe_lo = 0u;
     mm_u32 oe_hi = 0u;
+    mm_u64 pu = mm_rp2350_pad_pullups();
     mm_u64 driven;
     mm_u64 ext;
 
     mm_rp2350_pio_pad_state(&pio_lo, &pio_hi, &oe_lo, &oe_hi);
-    sio.in_lo = (sio.out_lo & ~oe_lo) | (pio_lo & oe_lo);
-    sio.in_hi = (sio.out_hi & ~oe_hi) | (pio_hi & oe_hi);
-    if (g_ext_valid == 0u) return;
-    driven = rp2350_gpio_driven(0);
-    ext = g_ext_valid & ~driven;
-    sio.in_lo = (sio.in_lo & ~(mm_u32)ext) | ((mm_u32)g_ext_level & (mm_u32)ext);
-    sio.in_hi = (sio.in_hi & ~(mm_u32)(ext >> 32)) | ((mm_u32)(g_ext_level >> 32) & (mm_u32)(ext >> 32));
+    /* SIO-driven pins read their output, PIO-driven pins the PIO level,
+     * undriven pins their pull (was: always the SIO output latch). */
+    sio.in_lo = (sio.out_lo & sio.oe_lo & ~oe_lo) | (pio_lo & oe_lo) |
+                ((mm_u32)pu & ~sio.oe_lo & ~oe_lo);
+    sio.in_hi = (sio.out_hi & sio.oe_hi & ~oe_hi) | (pio_hi & oe_hi) |
+                ((mm_u32)(pu >> 32) & ~sio.oe_hi & ~oe_hi);
+    if (g_ext_valid != 0u) {
+        /* an external circuit beats the pull */
+        driven = rp2350_gpio_driven(0);
+        ext = g_ext_valid & ~driven;
+        sio.in_lo = (sio.in_lo & ~(mm_u32)ext) | ((mm_u32)g_ext_level & (mm_u32)ext);
+        sio.in_hi = (sio.in_hi & ~(mm_u32)(ext >> 32)) | ((mm_u32)(g_ext_level >> 32) & (mm_u32)(ext >> 32));
+    }
 }
 
 static mm_bool resets_read(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 *value_out)
@@ -1472,6 +1511,11 @@ static mm_bool psm_read(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 *
 {
     struct psm_state *p = (struct psm_state *)opaque;
     if (p == 0 || value_out == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
+    offset &= 0xfffu;
+    if (offset == 0x00cu && size_bytes == 4u) { /* DONE: everything powered */
+        *value_out = 0x01ffffffu;
+        return MM_TRUE;
+    }
     if ((offset & 3u) != 0u || size_bytes != 4u) return MM_FALSE;
     if (offset == PSM_FRCE_ON) {
         *value_out = p->frce_on;
@@ -1493,8 +1537,8 @@ static void rp2350_core1_reset(void)
     rp2350_mc.boot_seq = 0u;
     rp2350_mc.wof[1] = 0u;
     rp2350_mc.roe[1] = 0u;
-    rp2350_fifo_clear(&rp2350_mc.rx[0]);
-    rp2350_fifo_clear(&rp2350_mc.rx[1]);
+    /* A core 1 reset does not flush the SIO mailboxes (the core 1 bootrom
+     * drains its own FIFO when it restarts). */
     rp2350_fifo_update_irq(0u);
     rp2350_fifo_update_irq(1u);
 }
@@ -1516,8 +1560,17 @@ static mm_bool psm_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 
 {
     struct psm_state *p = (struct psm_state *)opaque;
     mm_u32 prev_off;
+    mm_u32 alias;
     if (p == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
     if ((offset & 3u) != 0u || size_bytes != 4u) return MM_FALSE;
+    alias = (offset >> 12) & 3u;
+    offset &= 0xfffu;
+    if (alias != 0u && (offset == PSM_FRCE_ON || offset == PSM_FRCE_OFF)) {
+        mm_u32 cur = (offset == PSM_FRCE_ON) ? p->frce_on : p->frce_off;
+        if (alias == 1u) value = cur ^ value;
+        else if (alias == 2u) value = cur | value;
+        else value = cur & ~value;
+    }
     if (offset == PSM_FRCE_ON) {
         p->frce_on = value;
         if (value & PSM_FRCE_ON_PROC1) {
@@ -1876,12 +1929,20 @@ static mm_bool bank_read(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 
     return MM_TRUE;
 }
 
+static mm_u32 g_bank_gen = 1u; /* bumped on IO_BANK0/PADS_BANK0 writes */
+
+mm_u32 mm_rp2350_bank_generation(void)
+{
+    return g_bank_gen;
+}
+
 static mm_bool bank_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 value)
 {
     struct bank_regs *b = (struct bank_regs *)opaque;
     mm_u32 alias;
     mm_u32 base_off;
     mm_u32 mask;
+    if (b == &io_bank0 || b == &pads_bank0) g_bank_gen++;
     if (b == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
     if ((offset + size_bytes) > MMIO_ALIAS_SIZE) return MM_FALSE;
 
@@ -2616,12 +2677,10 @@ mm_bool mm_rp2350_register_mmio(struct mmio_bus *bus)
     reg.write = xip_maint_write;
     if (!mmio_bus_register_region(bus, &reg)) return MM_FALSE;
 
-    reg.size = DMA_SIZE;
-    reg.base = DMA_BASE;
-    reg.opaque = 0;
-    reg.read = dma_read;
-    reg.write = dma_write;
-    if (!mmio_bus_register_region(bus, &reg)) return MM_FALSE;
+    /* multi-channel DMA model (rp2350_dma.c) replaces dma_read/dma_write */
+    (void)dma_read;
+    (void)dma_write;
+    if (!mm_rp2350_dma_register(bus)) return MM_FALSE;
 
     reg.size = HSTX_FIFO_SIZE;
     reg.base = HSTX_FIFO_BASE;
@@ -2682,6 +2741,8 @@ mm_bool mm_rp2350_register_mmio(struct mmio_bus *bus)
     if (!mmio_bus_register_region(bus, &reg)) return MM_FALSE;
 
     if (!mm_rp2350_usb_register_mmio(bus)) return MM_FALSE;
+
+    if (!mm_rp2350_extra_register(bus)) return MM_FALSE;
 
     mm_gpio_bank_set_reader(rp2350_gpio_bank_read, 0);
     mm_gpio_bank_set_moder_reader(rp2350_gpio_bank_read_moder, 0);
@@ -2750,6 +2811,9 @@ void mm_rp2350_mmio_reset(void)
     rp2350_mc.core1_state = 1u; /* bootrom wait */
     rp2350_fifo_clear(&rp2350_mc.rx[0]);
     rp2350_fifo_clear(&rp2350_mc.rx[1]);
+    /* The core 1 bootrom drains its FIFO and pushes a 0 to core 0 when it
+     * comes out of the power-on reset, as it does after multicore_reset_core1. */
+    (void)rp2350_fifo_push(&rp2350_mc.rx[0], 0u);
 
     resets.regs[RESETS_RESET / 4u] = 0u;
     resets.regs[RESETS_RESET_DONE / 4u] = reset_mask();
@@ -2990,12 +3054,16 @@ void mm_rp2350_flash_bind(struct mm_memmap *map,
                           mm_u32 flags)
 {
     (void)flags;
-    (void)map;
     rp2350_flash.flash = flash;
     rp2350_flash.flash_size = flash_size;
     rp2350_flash.persist = persist;
     bootram.regs[BOOTRAM_FLASH_DEVINFO_OFFSET / 4u] = rp2350_flash_devinfo_value(flash_size);
     rp2350_partition_table_init();
+    mm_rp2350_extra_flash_bind(map, flash, flash_size);
+    if (mm_rp2350_extra_pt_loaded()) {
+        /* booted from partition 0 (FW A), as the real bootrom would report */
+        mm_rp2350_set_boot_info(-1, 0u, 0, 0u, rp2350_boot_info.boot_diagnostic | 0x0004u, 0u, 0u);
+    }
 }
 
 mm_u64 mm_rp2350_cpu_hz(void)

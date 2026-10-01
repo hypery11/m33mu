@@ -295,7 +295,7 @@ static mm_bool scs_read_nvic(struct mm_nvic *nvic, enum mm_sec_state eff_sec,
     if (offset >= 0x400u && offset < NVIC_IPR_END) {
         idx = offset - 0x400u;
         if (size_bytes == 1u) {
-            if (noisy) {
+            if (noisy && getenv("M33MU_NVIC_TRACE") != 0) {
                 printf("[NVIC_IPR_READ] off=0x%03lx idx=%lu -> 0x%02lx\n",
                        (unsigned long)offset,
                        (unsigned long)idx,

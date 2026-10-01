@@ -81,6 +81,8 @@
 #include "rp2350/rp2350_bootrom.h"
 #include "m33mu/bootapi.h"
 #include "rp2350/rp2350_usb.h"
+#include "rp2350/rp2350_pl011.h"
+#include "rp2350/rp2350_extra.h"
 #ifdef M33MU_HAS_LIBTPMS
 #include "m33mu/tpm_tis.h"
 #endif
@@ -1782,6 +1784,7 @@ static void handle_timeout_alarm(int sig)
 
     timeout_dump_cpu(g_cpu0, "TIMEOUT cpu0");
     timeout_dump_cpu(g_cpu1, "TIMEOUT cpu1");
+    mm_rp2350_exit_report(); /* peripheral stats, flush RTT/stdout */
     _exit(127);
 }
 
@@ -5610,7 +5613,11 @@ int main(int argc, char **argv)
             mm_prot_add_region(&execution.protection[0], 0xD0000000u, 0x10000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
             if (cpu_name != 0 && strcmp(cpu_name, "rp2350") == 0) {
                 mm_prot_add_region(&execution.protection[0], 0x18000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_SECURE);
+                mm_prot_add_region(&execution.protection[0], 0x14000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_SECURE);
+                mm_prot_add_region(&execution.protection[0], 0x1c000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_SECURE);
                 mm_prot_add_region(&execution.protection[0], 0x18000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
+                mm_prot_add_region(&execution.protection[0], 0x14000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
+                mm_prot_add_region(&execution.protection[0], 0x1c000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
             }
             if (execution.target.core_count > 1u) {
                 mm_prot_add_region(&execution.protection[1], execution.target.flash_base_s, execution.target.flash_size_s, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE | MM_PROT_PERM_EXEC, MM_SECURE);
@@ -5656,7 +5663,11 @@ int main(int argc, char **argv)
                 mm_prot_add_region(&execution.protection[1], 0xD0000000u, 0x10000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
                 if (cpu_name != 0 && strcmp(cpu_name, "rp2350") == 0) {
                     mm_prot_add_region(&execution.protection[1], 0x18000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_SECURE);
+                    mm_prot_add_region(&execution.protection[1], 0x14000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_SECURE);
+                    mm_prot_add_region(&execution.protection[1], 0x1c000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_SECURE);
                     mm_prot_add_region(&execution.protection[1], 0x18000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
+                    mm_prot_add_region(&execution.protection[1], 0x14000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
+                    mm_prot_add_region(&execution.protection[1], 0x1c000000u, 0x04000000u, MM_PROT_PERM_READ | MM_PROT_PERM_WRITE, MM_NONSECURE);
                 }
             }
             mm_spiflash_register_prot_regions(&execution.protection[0]);
@@ -5668,6 +5679,7 @@ int main(int argc, char **argv)
                 mm_nvic_set_lines(&execution.cores[1].nvic, execution.target.irq_lines);
             }
             g_cpu0 = &execution.cores[0].cpu;
+            mm_rp2350_extra_set_cpu0(g_cpu0);
             g_nvic0 = &execution.cores[0].nvic;
             g_cycle_total = &execution.clock.cycle_total;
             if (execution.target.core_count > 1u) {

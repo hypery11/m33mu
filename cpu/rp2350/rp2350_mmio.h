@@ -59,6 +59,9 @@ void mm_rp2350_flash_bind(struct mm_memmap *map,
 mm_u64 mm_rp2350_cpu_hz(void);
 mm_bool mm_rp2350_reset_asserted(mm_u32 mask);
 mm_u32 mm_rp2350_gpio_funcsel(mm_u32 pin);
+mm_u64 mm_rp2350_pad_pullups(void);
+mm_u32 mm_rp2350_bank_generation(void);
+void mm_rp2350_gpio_overrides(mm_u64 masks[6]);
 void mm_rp2350_sio_pad_state(mm_u32 *out_lo, mm_u32 *out_hi, mm_u32 *oe_lo, mm_u32 *oe_hi);
 /* Levels an external circuit drives on undriven GPIOs (mm_gpio external
  * input writer), and which GPIOs it drives. */

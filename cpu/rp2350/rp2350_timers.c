@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "rp2350/rp2350_timers.h"
+#include "rp2350/rp2350_pl011.h"
+#include "rp2350/rp2350_extra.h"
 #include "m33mu/mmio.h"
 #include "m33mu/nvic.h"
 #include "rp2350/cpu_config.h"
@@ -436,6 +438,8 @@ void mm_rp2350_timers_tick(mm_u64 cycles)
     int i;
 
     mm_rp2350_pio_tick(cycles);
+    mm_rp2350_pl011_tick(cycles);
+    mm_rp2350_extra_tick(cycles);
     if (cycles_per_us == 0u) cycles_per_us = 1u;
     g_cycle_accum += cycles;
     inc = g_cycle_accum / cycles_per_us;

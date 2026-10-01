@@ -63,15 +63,6 @@
 #define SSPSR_RFF (1u << 3)
 #define SSPSR_BSY (1u << 4)
 
-struct uart_inst {
-    mm_u32 base;
-    mm_u32 reset_bit;
-    mm_u32 regs[UART_SIZE / 4u];
-    struct mm_uart_io io;
-    char label[16];
-    mm_bool enabled;
-};
-
 struct spi_inst {
     mm_u32 base;
     mm_u32 reset_bit;
@@ -81,125 +72,7 @@ struct spi_inst {
     int bus;
 };
 
-static struct uart_inst uarts[2];
 static struct spi_inst spis[2];
-
-static void uart_update_flags(struct uart_inst *u)
-{
-    mm_u32 fr = 0u;
-    mm_bool rx_empty = MM_TRUE;
-    if (u == 0) return;
-    if (mm_uart_io_has_rx(&u->io)) {
-        rx_empty = MM_FALSE;
-    }
-    if (rx_empty) {
-        fr |= UARTFR_RXFE;
-    }
-    fr |= UARTFR_TXFE;
-    u->regs[UARTFR / 4u] = fr;
-}
-
-static mm_bool uart_clock_on(struct uart_inst *u)
-{
-    if (u == 0) return MM_FALSE;
-    if (!mm_rp2350_clock_peri_enabled()) return MM_FALSE;
-    if (mm_rp2350_reset_asserted(u->reset_bit)) return MM_FALSE;
-    return MM_TRUE;
-}
-
-static void uart_ensure_enabled(struct uart_inst *u)
-{
-    mm_bool want;
-    mm_u32 cr;
-    if (u == 0) return;
-    cr = u->regs[UARTCR / 4u];
-    want = ((cr & UARTCR_UARTEN) != 0u) && uart_clock_on(u);
-    if (want && !u->enabled) {
-        if (mm_uart_io_open(&u->io, u->base)) {
-            if (mm_tui_is_active()) {
-                mm_tui_attach_uart(u->label, u->io.name);
-            }
-        }
-    } else if (!want && u->enabled) {
-        mm_uart_io_close(&u->io);
-    }
-    u->enabled = want;
-    uart_update_flags(u);
-}
-
-static mm_bool uart_read(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 *value_out)
-{
-    struct uart_inst *u = (struct uart_inst *)opaque;
-    if (u == 0 || value_out == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
-    if (offset + size_bytes > UART_SIZE) return MM_FALSE;
-
-    uart_ensure_enabled(u);
-    if (offset == UARTDR && (size_bytes == 1u || size_bytes == 2u || size_bytes == 4u)) {
-        mm_u32 v = 0u;
-        if (u->enabled && mm_uart_io_has_rx(&u->io)) {
-            if (mmio_peek_mode()) {
-                v = (mm_u32)mm_uart_io_peek(&u->io);
-            } else {
-                v = (mm_u32)mm_uart_io_read(&u->io);
-            }
-        }
-        if (size_bytes == 1u) {
-            v &= 0xffu;
-        } else if (size_bytes == 2u) {
-            v &= 0xffffu;
-        }
-        *value_out = v;
-        if (!mmio_peek_mode()) {
-            uart_update_flags(u);
-        }
-        return MM_TRUE;
-    }
-    if (offset == UARTFR && (size_bytes == 1u || size_bytes == 2u || size_bytes == 4u)) {
-        if (!mmio_peek_mode()) {
-            uart_update_flags(u);
-        }
-        {
-            mm_u32 v = u->regs[UARTFR / 4u];
-            if (size_bytes == 1u) {
-                v &= 0xffu;
-            } else if (size_bytes == 2u) {
-                v &= 0xffffu;
-            }
-            *value_out = v;
-        }
-        return MM_TRUE;
-    }
-
-    *value_out = u->regs[offset / 4u];
-    return MM_TRUE;
-}
-
-static mm_bool uart_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 value)
-{
-    struct uart_inst *u = (struct uart_inst *)opaque;
-    if (u == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
-    if (offset + size_bytes > UART_SIZE) return MM_FALSE;
-
-    if (offset == UARTDR && (size_bytes == 1u || size_bytes == 2u || size_bytes == 4u)) {
-        uart_ensure_enabled(u);
-        if (u->enabled && ((u->regs[UARTCR / 4u] & UARTCR_TXE) != 0u)) {
-            mm_uart_io_queue_tx(&u->io, (mm_u8)(value & 0xffu));
-            (void)mm_uart_io_flush(&u->io);
-        }
-        return MM_TRUE;
-    }
-    if (offset == UARTICR && size_bytes == 4u) {
-        u->regs[UARTRIS / 4u] = 0u;
-        u->regs[UARTMIS / 4u] = 0u;
-        return MM_TRUE;
-    }
-
-    u->regs[offset / 4u] = value;
-    if (offset == UARTCR) {
-        uart_ensure_enabled(u);
-    }
-    return MM_TRUE;
-}
 
 static mm_bool spi_clock_on(struct spi_inst *s)
 {
@@ -280,59 +153,6 @@ static mm_bool spi_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 
     s->regs[offset / 4u] = value;
     spi_update_status(s);
     return MM_TRUE;
-}
-
-void mm_rp2350_uart_init(struct mmio_bus *bus, struct mm_nvic *nvic)
-{
-    struct mmio_region reg;
-    mm_rp2350_usb_set_nvic(nvic);
-    if (bus == 0) return;
-
-    memset(&reg, 0, sizeof(reg));
-
-    uarts[0].base = UART0_BASE;
-    uarts[0].reset_bit = RP2350_RESET_UART0;
-    snprintf(uarts[0].label, sizeof(uarts[0].label), "UART0");
-    mm_uart_instance_register(UART0_BASE, uarts[0].label);
-    mm_uart_io_init(&uarts[0].io);
-
-    reg.base = UART0_BASE;
-    reg.size = UART_SIZE;
-    reg.opaque = &uarts[0];
-    reg.read = uart_read;
-    reg.write = uart_write;
-    (void)mmio_bus_register_region(bus, &reg);
-
-    uarts[1].base = UART1_BASE;
-    uarts[1].reset_bit = RP2350_RESET_UART1;
-    snprintf(uarts[1].label, sizeof(uarts[1].label), "UART1");
-    mm_uart_instance_register(UART1_BASE, uarts[1].label);
-    mm_uart_io_init(&uarts[1].io);
-
-    reg.base = UART1_BASE;
-    reg.opaque = &uarts[1];
-    (void)mmio_bus_register_region(bus, &reg);
-}
-
-void mm_rp2350_uart_reset(void)
-{
-    size_t i;
-    for (i = 0; i < sizeof(uarts) / sizeof(uarts[0]); ++i) {
-        memset(uarts[i].regs, 0, sizeof(uarts[i].regs));
-        uarts[i].enabled = MM_FALSE;
-        mm_uart_io_close(&uarts[i].io);
-    }
-}
-
-void mm_rp2350_uart_poll(void)
-{
-    size_t i;
-    for (i = 0; i < sizeof(uarts) / sizeof(uarts[0]); ++i) {
-        if (uarts[i].enabled) {
-            (void)mm_uart_io_poll(&uarts[i].io);
-            uart_update_flags(&uarts[i]);
-        }
-    }
 }
 
 void mm_rp2350_spi_init(struct mmio_bus *bus, struct mm_nvic *nvic)

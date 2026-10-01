@@ -20,6 +20,7 @@ void mm_rp2350_pio_reset(void);
 
 /* Advance every enabled state machine by `cycles` system clocks. */
 void mm_rp2350_pio_tick(mm_u64 cycles);
+void mm_rp2350_pio_dump(void);
 
 /*
  * Pads currently driven by a PIO block (only pins whose IO_BANK0 function

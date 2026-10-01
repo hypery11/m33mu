@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "rp2350/rp2350_bootrom.h"
+#include "rp2350/rp2350_extra.h"
 #include "rp2350/rp2350_mmio.h"
 
 #define RP2350_BOOTROM_MAGIC_OFFSET 0x10u
@@ -635,7 +636,11 @@ mm_bool mm_rp2350_bootrom_handle(struct mm_cpu *cpu, struct mm_memmap *map)
         rp2350_bootrom_return(cpu);
         return MM_TRUE;
     case RP2350_ROM_GET_PARTITION_TABLE_INFO_ADDR:
-        cpu->r[0] = rp2350_partition_table_info(map, cpu->sec_state, cpu->r[0], cpu->r[1], cpu->r[2]);
+        if (mm_rp2350_extra_pt_loaded()) {
+            cpu->r[0] = mm_rp2350_extra_pt_info(map, cpu->sec_state, cpu->r[0], cpu->r[1], cpu->r[2]);
+        } else {
+            cpu->r[0] = rp2350_partition_table_info(map, cpu->sec_state, cpu->r[0], cpu->r[1], cpu->r[2]);
+        }
         rp2350_bootrom_return(cpu);
         return MM_TRUE;
     case RP2350_ROM_GET_SYS_INFO_ADDR:

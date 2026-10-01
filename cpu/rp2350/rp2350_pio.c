@@ -183,6 +183,16 @@ static struct mm_nvic *g_pio_nvic;
 static mm_u64 g_pio_owner[PIO_COUNT];  /* pins whose FUNCSEL selects this block */
 static mm_u64 g_sio_out;
 static mm_u64 g_sio_oe;
+static mm_u64 g_pullups = 0u;
+static mm_u64 g_over[6]; /* oe inv/low/high, out inv/low/high */
+
+static mm_u64 apply_over(mm_u64 v, mm_u64 inv, mm_u64 lo, mm_u64 hi)
+{
+    v ^= inv;
+    v &= ~lo;
+    v |= hi;
+    return v;
+}
 static mm_u64 g_pad_level;
 static mm_bool g_pads_dirty = MM_TRUE;
 static mm_bool g_pio_trace;
@@ -271,6 +281,8 @@ static void fdebug_set(struct pio_block *b, mm_u32 shift, mm_u32 smi)
  */
 static void pio_pads_snapshot(void)
 {
+    static mm_u32 last_gen = 0u;
+    mm_u32 gen = mm_rp2350_bank_generation();
     mm_u32 lo = 0u;
     mm_u32 hi = 0u;
     mm_u32 oe_lo = 0u;
@@ -278,12 +290,20 @@ static void pio_pads_snapshot(void)
     mm_u32 pin;
     mm_u32 i;
 
-    for (i = 0; i < PIO_COUNT; ++i) g_pio_owner[i] = 0u;
-    for (pin = 0; pin < PIO_PIN_COUNT; ++pin) {
-        mm_u32 fsel = mm_rp2350_gpio_funcsel(pin);
-        if (fsel >= FUNCSEL_PIO0 && fsel < FUNCSEL_PIO0 + PIO_COUNT) {
-            g_pio_owner[fsel - FUNCSEL_PIO0] |= 1ull << pin;
+    /* pin muxing, pulls and overrides only change on IO_BANK0 /
+     * PADS_BANK0 writes, so recompute them only then (this runs per CPU
+     * instruction while a state machine is enabled). */
+    if (gen != last_gen) {
+        for (i = 0; i < PIO_COUNT; ++i) g_pio_owner[i] = 0u;
+        for (pin = 0; pin < PIO_PIN_COUNT; ++pin) {
+            mm_u32 fsel = mm_rp2350_gpio_funcsel(pin);
+            if (fsel >= FUNCSEL_PIO0 && fsel < FUNCSEL_PIO0 + PIO_COUNT) {
+                g_pio_owner[fsel - FUNCSEL_PIO0] |= 1ull << pin;
+            }
         }
+        g_pullups = mm_rp2350_pad_pullups();
+        mm_rp2350_gpio_overrides(g_over);
+        last_gen = gen;
     }
     mm_rp2350_sio_pad_state(&lo, &hi, &oe_lo, &oe_hi);
     g_sio_out = (mm_u64)lo | ((mm_u64)hi << 32);
@@ -299,11 +319,14 @@ static void pio_pads_refresh(void)
     mm_u32 i;
 
     for (i = 0; i < PIO_COUNT; ++i) {
-        mm_u64 own = g_pio[i].pad_oe & g_pio_owner[i];
-        level = (level & ~own) | (g_pio[i].pad_out & own);
+        mm_u64 oe = apply_over(g_pio[i].pad_oe, g_over[0], g_over[1], g_over[2]);
+        mm_u64 out = apply_over(g_pio[i].pad_out, g_over[3], g_over[4], g_over[5]);
+        mm_u64 own = oe & g_pio_owner[i];
+        level = (level & ~own) | (out & own);
         driven |= own;
     }
     level |= g_sio_out & g_sio_oe & ~driven;
+    level |= g_pullups & ~g_sio_oe & ~driven; /* pad pull-ups on undriven pins */
     {
         /* Undriven pins read what an external circuit drives. */
         mm_u64 ext_level = 0u;
@@ -329,18 +352,12 @@ void mm_rp2350_pio_pad_state(mm_u32 *out_lo, mm_u32 *out_hi, mm_u32 *oe_lo, mm_u
     mm_u64 oe = 0u;
     mm_u32 i;
 
-    /* Cheap exit for the common case of a system that never enables PIO. */
-    if ((g_pio[0].pad_oe | g_pio[1].pad_oe | g_pio[2].pad_oe) == 0u) {
-        if (out_lo != 0) *out_lo = 0u;
-        if (out_hi != 0) *out_hi = 0u;
-        if (oe_lo != 0) *oe_lo = 0u;
-        if (oe_hi != 0) *oe_hi = 0u;
-        return;
-    }
     pio_pads_snapshot();
     for (i = 0; i < PIO_COUNT; ++i) {
-        mm_u64 own = g_pio[i].pad_oe & g_pio_owner[i];
-        out = (out & ~own) | (g_pio[i].pad_out & own);
+        mm_u64 poe = apply_over(g_pio[i].pad_oe, g_over[0], g_over[1], g_over[2]);
+        mm_u64 pout = apply_over(g_pio[i].pad_out, g_over[3], g_over[4], g_over[5]);
+        mm_u64 own = poe & g_pio_owner[i];
+        out = (out & ~own) | (pout & own);
         oe |= own;
     }
     if (out_lo != 0) *out_lo = (mm_u32)out;
@@ -1225,6 +1242,12 @@ static mm_bool pio_mmio_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm
     mask = (size_bytes >= 4u) ? 0xffffffffu : (((1u << (size_bytes * 8u)) - 1u) << (lane * 8u));
     wdata = (size_bytes >= 4u) ? value : ((value << (lane * 8u)) & mask);
 
+    if (reg >= PIO_TXF0 && reg < PIO_RXF0 && size_bytes < 4u) {
+        /* AHB narrow writes are replicated across the word: a halfword
+         * TXF write lands in both halves (pio_i2c relies on this). */
+        wdata = (size_bytes == 2u) ? ((value & 0xffffu) * 0x00010001u)
+                                   : ((value & 0xffu) * 0x01010101u);
+    }
     if (alias == 0u) {
         if (mask != 0xffffffffu && !(reg >= PIO_TXF0 && reg < PIO_RXF0)) {
             wdata |= pio_read32(b, reg, MM_FALSE) & ~mask;
@@ -1310,11 +1333,40 @@ static mm_u32 pio_active_mask(void)
     return mask;
 }
 
+/* Signature of everything a stalled state machine could change. */
+static mm_u64 pio_state_sig(mm_u32 active, mm_bool *all_stalled, mm_u32 *max_div)
+{
+    mm_u64 h = 0u;
+    mm_u32 i, smi;
+    *all_stalled = MM_TRUE;
+    *max_div = 1u;
+    for (i = 0; i < PIO_COUNT; ++i) {
+        struct pio_block *b;
+        if ((active & (1u << i)) == 0u) continue;
+        b = &g_pio[i];
+        h = h * 1099511628211ull + b->irq + (b->pad_out << 3) + (b->pad_oe << 7);
+        for (smi = 0; smi < PIO_SM_COUNT; ++smi) {
+            struct pio_sm *s = &b->sm[smi];
+            mm_u32 div;
+            if ((b->sm_enable & (1u << smi)) == 0u) continue;
+            if (!s->stalled || s->delay != 0u) *all_stalled = MM_FALSE;
+            div = ((s->clkdiv >> 16) & 0xffffu) + 2u;
+            if (div > *max_div) *max_div = div;
+            h = h * 1099511628211ull + s->pc + ((mm_u64)s->stalled << 8) + ((mm_u64)s->tx.count << 9) +
+                ((mm_u64)s->rx.count << 13) + ((mm_u64)s->exec_valid << 17) + ((mm_u64)s->osr_count << 18) +
+                ((mm_u64)s->isr_count << 24) + ((mm_u64)s->x << 30) + ((mm_u64)s->y << 34) + s->isr + s->osr;
+        }
+    }
+    return h;
+}
+
 static void pio_run_cycles(mm_u64 cycles, mm_u32 active)
 {
     mm_u64 n;
     mm_u32 i;
     mm_u32 smi;
+    mm_u64 sig = 0u;
+    mm_u32 quiet = 0u;
 
     for (n = 0; n < cycles; ++n) {
         for (i = 0; i < PIO_COUNT; ++i) {
@@ -1325,6 +1377,21 @@ static void pio_run_cycles(mm_u64 cycles, mm_u32 active)
                 if (!sm_clock_tick(&b->sm[smi])) continue;
                 if ((b->sm_enable & (1u << smi)) == 0u) continue;
                 sm_cycle(b, smi);
+            }
+        }
+        /* once every enabled state machine has sat stalled with no
+         * state change for a whole clock-divider period, nothing can change
+         * until the CPU touches the PIO again, so skip the rest of the tick
+         * (an idle core advanced ~10^5 cycles at a time through every SM). */
+        if (cycles > 16u) {
+            mm_bool all_stalled;
+            mm_u32 max_div;
+            mm_u64 h = pio_state_sig(active, &all_stalled, &max_div);
+            if (all_stalled && h == sig) {
+                if (++quiet > max_div) break;
+            } else {
+                quiet = 0u;
+                sig = h;
             }
         }
     }
@@ -1388,4 +1455,27 @@ mm_bool mm_rp2350_pio_dreq_wait(mm_u32 addr, mm_bool is_write)
     for (smi = 0; smi < PIO_COUNT; ++smi) pio_update_irqs(&g_pio[smi]);
     if (is_write) return ((mm_u32)s->tx.count < sm_tx_depth(s)) ? MM_TRUE : MM_FALSE;
     return (s->rx.count != 0u) ? MM_TRUE : MM_FALSE;
+}
+
+/* Debugging aid: state of every enabled state machine (called at exit). */
+void mm_rp2350_pio_dump(void)
+{
+    mm_u32 i, smi;
+    pio_pads_snapshot();
+    for (i = 0; i < PIO_COUNT; ++i) {
+        struct pio_block *b = &g_pio[i];
+        if (b->sm_enable == 0u) continue;
+        fprintf(stderr, "[PIO%u] en=0x%x irq=0x%x gpiobase=%u pad_oe=%012llx pad_out=%012llx owner=%012llx level=%012llx pullups=%012llx oeinv=%012llx\n",
+                i, b->sm_enable, b->irq, b->gpiobase, (unsigned long long)b->pad_oe,
+                (unsigned long long)b->pad_out, (unsigned long long)g_pio_owner[i],
+                (unsigned long long)pio_pad_levels(), (unsigned long long)g_pullups,
+                (unsigned long long)g_over[0]);
+        for (smi = 0; smi < PIO_SM_COUNT; ++smi) {
+            struct pio_sm *s = &b->sm[smi];
+            if ((b->sm_enable & (1u << smi)) == 0u) continue;
+            fprintf(stderr, "[PIO%u SM%u] pc=%u instr=0x%04x stalled=%u x=%u y=%u osr_count=%u tx=%u rx=%u pinctrl=0x%08x execctrl=0x%08x\n",
+                    i, smi, s->pc, b->imem[s->pc & 31u], s->stalled, s->x, s->y, s->osr_count,
+                    s->tx.count, s->rx.count, s->pinctrl, s->execctrl);
+        }
+    }
 }

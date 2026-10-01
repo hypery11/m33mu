@@ -154,6 +154,17 @@ enum mm_sec_state mm_nvic_irq_target_sec(const struct mm_nvic *nvic, mm_u32 irq)
     return ((nvic->itns_mask[word] & mask) != 0u) ? MM_NONSECURE : MM_SECURE;
 }
 
+/* level-sensitive peripheral lines.  On exception return the NVIC
+ * samples the line again and re-pends the IRQ if it is still asserted, so a
+ * handler that returns without clearing its cause is re-entered before any
+ * thread code runs (as on the real NVIC). */
+static mm_nvic_level_fn g_nvic_level_fn = 0;
+
+void mm_nvic_set_level_source(mm_nvic_level_fn fn)
+{
+    g_nvic_level_fn = fn;
+}
+
 void mm_nvic_set_active(struct mm_nvic *nvic, mm_u32 irq, mm_bool active)
 {
     mm_u32 word = irq / 32u;
@@ -162,7 +173,12 @@ void mm_nvic_set_active(struct mm_nvic *nvic, mm_u32 irq, mm_bool active)
     if (nvic == 0) return;
     if (irq >= mm_nvic_lines(nvic)) return;
     if (active) nvic->active_mask[word] |= mask;
-    else nvic->active_mask[word] &= ~mask;
+    else {
+        nvic->active_mask[word] &= ~mask;
+        if (g_nvic_level_fn != 0 && g_nvic_level_fn(irq)) {
+            nvic->pending_mask[word] |= mask;
+        }
+    }
 }
 
 mm_bool mm_nvic_any_pending_enabled(const struct mm_nvic *nvic)

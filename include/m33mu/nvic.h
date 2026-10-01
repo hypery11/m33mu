@@ -58,6 +58,8 @@ mm_bool mm_nvic_is_active(const struct mm_nvic *nvic, mm_u32 irq);
 void mm_nvic_set_itns(struct mm_nvic *nvic, mm_u32 irq, mm_bool target_nonsecure);
 enum mm_sec_state mm_nvic_irq_target_sec(const struct mm_nvic *nvic, mm_u32 irq);
 void mm_nvic_set_active(struct mm_nvic *nvic, mm_u32 irq, mm_bool active);
+typedef mm_bool (*mm_nvic_level_fn)(mm_u32 irq);
+void mm_nvic_set_level_source(mm_nvic_level_fn fn);
 mm_bool mm_nvic_any_pending_enabled(const struct mm_nvic *nvic);
 mm_bool mm_nvic_any_pending(const struct mm_nvic *nvic);
 void mm_nvic_set_enable_hook(mm_nvic_enable_hook_t hook, void *opaque);

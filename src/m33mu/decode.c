@@ -1729,6 +1729,43 @@ static struct mm_decoded decode_32(mm_u32 insn)
         }
     }
 
+    /* Load-acquire / store-release and the byte/halfword exclusives
+     * (ARMv8-M), decoded precisely (LDAB/LDAH/LDA, LDREXB and
+     * STLEXB/STLEXH were missing or aliased):
+     *   hw1 = 1110 1000 110L Rn, hw2 = Rt 1111 op Rd */
+    if ((insn & 0xffe00f00u) == 0xe8c00f00u) {
+        mm_bool load = ((insn >> 20) & 1u) != 0u;
+        mm_u32 op = (insn >> 4) & 0xfu;
+        mm_u8 rt = (mm_u8)((insn >> 12) & 0x0fu);
+        mm_u8 rlow = (mm_u8)(insn & 0x0fu);
+        mm_bool ok = MM_TRUE;
+        d.rn = (mm_u8)((insn >> 16) & 0x0fu);
+        d.imm = 0u;
+        if (load) {
+            d.rd = rt;
+            if (rlow != 0xfu) ok = MM_FALSE;
+            else if (op == 0x4u || op == 0xcu) d.kind = MM_OP_LDREXB;
+            else if (op == 0x5u || op == 0xdu) d.kind = MM_OP_LDREXH;
+            else if (op == 0xeu) d.kind = MM_OP_LDREX;
+            else if (op == 0x8u) d.kind = MM_OP_LDRB_IMM;
+            else if (op == 0x9u) d.kind = MM_OP_LDRH_IMM;
+            else if (op == 0xau) d.kind = MM_OP_LDR_IMM;
+            else ok = MM_FALSE;
+        } else {
+            if (op == 0x4u || op == 0xcu) { d.kind = MM_OP_STREXB; d.rm = rt; d.rd = rlow; }
+            else if (op == 0x5u || op == 0xdu) { d.kind = MM_OP_STREXH; d.rm = rt; d.rd = rlow; }
+            else if (op == 0xeu) { d.kind = MM_OP_STREX; d.rm = rt; d.rd = rlow; }
+            else if (rlow == 0xfu && op == 0x8u) { d.kind = MM_OP_STRB_IMM; d.rd = rt; }
+            else if (rlow == 0xfu && op == 0x9u) { d.kind = MM_OP_STRH_IMM; d.rd = rt; }
+            else if (rlow == 0xfu && op == 0xau) { d.kind = MM_OP_STR_IMM; d.rd = rt; }
+            else ok = MM_FALSE;
+        }
+        if (ok) {
+            d.undefined = MM_FALSE;
+            return d;
+        }
+    }
+
     /* LDAEX (word) */
     if ((insn & 0xfff00ff0u) == 0xe8d00fe0u) {
         d.kind = MM_OP_LDREX;
@@ -1819,7 +1856,8 @@ static struct mm_decoded decode_32(mm_u32 insn)
      * stacked frames for the RTOS test.  Swap the fields to match the architecture.
      */
     if ((insn & 0xfe400000u) == 0xe8400000u &&
-        (insn & 0xfff0ffe0u) != 0xe8d0f000u) {
+        (insn & 0xfff0ffe0u) != 0xe8d0f000u &&
+        (((insn >> 24) & 1u) != 0u || ((insn >> 21) & 1u) != 0u)) {
         mm_bool load = ((insn >> 20) & 1u) != 0u;
         mm_bool u = ((insn >> 23) & 1u) != 0u;
         mm_bool w = ((insn >> 21) & 1u) != 0u;

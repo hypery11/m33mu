@@ -6144,14 +6144,25 @@ int main(int argc, char **argv)
                                 &execution, 0u, host_deadline);
                         if (delta == (mm_u64)-1) {
                             mm_u64 idle_cycles = 0;
+                            mm_u64 slept_ns = IDLE_SLEEP_NS;
                             if (!g_no_realtime) {
                                 struct timespec req;
+                                struct timespec t_a, t_b;
                                 req.tv_sec = 0;
                                 req.tv_nsec = (long)IDLE_SLEEP_NS;
+                                clock_gettime(CLOCK_MONOTONIC, &t_a);
                                 nanosleep(&req, 0);
+                                clock_gettime(CLOCK_MONOTONIC, &t_b);
+                                /* advance virtual time by the time actually
+                                 * slept (host timer slack made a 200 us nap
+                                 * last ~1 ms, so an idle guest ran several
+                                 * times slower than wall-clock time) */
+                                slept_ns = (mm_u64)((t_b.tv_sec - t_a.tv_sec) * 1000000000ll + (t_b.tv_nsec - t_a.tv_nsec));
+                                if (slept_ns < IDLE_SLEEP_NS) slept_ns = IDLE_SLEEP_NS;
+                                if (slept_ns > 20000000ull) slept_ns = 20000000ull;
                             }
                             if (cpu_hz != 0) {
-                                idle_cycles = (mm_u64)(((long double)cpu_hz * (long double)IDLE_SLEEP_NS) / (long double)NS_PER_SEC);
+                                idle_cycles = (mm_u64)(((long double)cpu_hz * (long double)slept_ns) / (long double)NS_PER_SEC);
                             }
                             if (idle_cycles == 0) {
                                 idle_cycles = 1;

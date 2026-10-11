@@ -35,6 +35,11 @@ struct rp2350_dcp_state {
     mm_u8 status_cmp;
     mm_u32 last_cmp_flags;
     mm_bool engaged;
+    /* ADD1/SUB1 already folded Y into X, so the result read (RDDA/RDDS,
+     * RDFA/RDFS) must return X as it is.  It used to add/subtract Y a second
+     * time: every DCP x + y came back as x + 2y and x - y as x - 2y (seen as
+     * printf("%.3f", 7.6f) -> "7.000": pico_printf takes value - (int)value). */
+    mm_bool addsub_done;
 };
 
 static struct rp2350_dcp_state dcp_state_s;
@@ -203,6 +208,7 @@ mm_bool mm_rp2350_dcp_mcrr(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8
         }
         break;
     case 1u: /* WXUP/WYUP/WXYU */
+        state->addsub_done = MM_FALSE;
         if (crm == 0u) {
             state->x_d_bits = ((mm_u64)hi << 32) | lo;
             state->cmp_mode = 2u;
@@ -289,11 +295,11 @@ mm_bool mm_rp2350_dcp_mrrc(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8
         double yd = u64_to_double(state->y_d_bits);
         double res = 0.0;
         switch (op1) {
-        case 1u: res = xd + yd; break; /* RDDA */
+        case 1u: res = state->addsub_done ? xd : xd + yd; break; /* RDDA */
         case 3u:
             if (state->conv_src == DCP_CONV_INT) res = (double)state->conv_i;
             else if (state->conv_src == DCP_CONV_UINT) res = (double)state->conv_u;
-            else res = xd - yd;
+            else res = state->addsub_done ? xd : xd - yd;
             break; /* RDDS */
         case 5u: res = xd * yd; break; /* RDDM */
         case 7u: res = xd / yd; break; /* RDDD */
@@ -309,6 +315,7 @@ mm_bool mm_rp2350_dcp_mrrc(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8
         if (!peek) {
             state->conv_src = DCP_CONV_NONE;
             state->engaged = MM_FALSE;
+            state->addsub_done = MM_FALSE;
         }
         return MM_TRUE;
     }
@@ -396,11 +403,11 @@ mm_bool mm_rp2350_dcp_mrc(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8 
     } else if (crm == 2u) {
         float fres = 0.0f;
         switch (op2) {
-        case 0u: fres = xf + yf; break;
+        case 0u: fres = state->addsub_done ? xf : xf + yf; break;
         case 1u:
             if (state->conv_src == DCP_CONV_INT) fres = (float)state->conv_i;
             else if (state->conv_src == DCP_CONV_UINT) fres = (float)state->conv_u;
-            else fres = xf - yf;
+            else fres = state->addsub_done ? xf : xf - yf;
             break;
         case 2u: fres = xf * yf; break;
         case 3u: fres = xf / yf; break;
@@ -412,6 +419,7 @@ mm_bool mm_rp2350_dcp_mrc(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8 
         if (!peek && op2 <= 5u) {
             state->conv_src = DCP_CONV_NONE;
             state->engaged = MM_FALSE;
+            state->addsub_done = MM_FALSE;
         }
     } else if (crm == 3u) {
         mm_bool round_nearest = (state->round_mode != 0u);
@@ -439,6 +447,7 @@ mm_bool mm_rp2350_dcp_mrc(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8 
         if (!peek) {
             state->conv_src = DCP_CONV_NONE;
             state->engaged = MM_FALSE;
+            state->addsub_done = MM_FALSE;
         }
     }
     *value_out = out;
@@ -496,6 +505,7 @@ mm_bool mm_rp2350_dcp_cdp(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8 
             } else {
                 state->x_d_bits = double_to_u64(xd + yd);
             }
+            state->addsub_done = MM_TRUE;
             state->engaged = MM_TRUE;
             return MM_TRUE;
         }
@@ -505,6 +515,7 @@ mm_bool mm_rp2350_dcp_cdp(enum mm_sec_state sec, mm_u8 coproc, mm_u8 op1, mm_u8 
             } else {
                 state->x_d_bits = double_to_u64(xd - yd);
             }
+            state->addsub_done = MM_TRUE;
             state->engaged = MM_TRUE;
             return MM_TRUE;
         }

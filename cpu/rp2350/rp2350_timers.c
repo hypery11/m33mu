@@ -13,6 +13,7 @@
 #include "rp2350/cpu_config.h"
 #include "rp2350/rp2350_mmio.h"
 #include "rp2350/rp2350_pio.h"
+#include "rp2350/rp2350_ina219.h"
 
 #define TIMER0_BASE 0x400b0000u
 #define TIMER1_BASE 0x400b8000u
@@ -437,6 +438,7 @@ void mm_rp2350_timers_tick(mm_u64 cycles)
     mm_u64 inc;
     int i;
 
+    mm_rp2350_ina219_tick(cycles);
     mm_rp2350_pio_tick(cycles);
     mm_rp2350_pl011_tick(cycles);
     mm_rp2350_extra_tick(cycles);

@@ -41,6 +41,7 @@
 #include "rp2350/rp2350_usb.h"
 #include "rp2350/rp2350_extra.h"
 #include "rp2350/rp2350_pio.h"
+#include "rp2350/rp2350_ina219.h"
 #include "rp2350/rp2350_dma.h"
 #include "m33mu/mmio.h"
 #include "m33mu/target_hal.h"
@@ -514,6 +515,7 @@ void mm_rp2350_exit_report(void)
     mm_rp2350_extra_flush();
     mm_rp2350_pl011_stats();
     mm_rp2350_extra_stats();
+    mm_rp2350_ina219_stats();
     mm_rp2350_dma_stats();
     if (getenv("M33MU_PIO_DUMP")) mm_rp2350_pio_dump();
     fflush(stdout);

@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include "rp2350/rp2350_pio.h"
 #include "rp2350/rp2350_mmio.h"
+#include "rp2350/rp2350_ina219.h"
 #include "m33mu/mmio.h"
 #include "m33mu/nvic.h"
 
@@ -195,6 +196,10 @@ static mm_u64 apply_over(mm_u64 v, mm_u64 inv, mm_u64 lo, mm_u64 hi)
 }
 static mm_u64 g_pad_level;
 static mm_bool g_pads_dirty = MM_TRUE;
+/* optional external open-drain device on the pads (the INA219 I2C
+ * slave model, M33MU_INA219=1).  g_ext_low = pads it currently pulls low. */
+static mm_bool g_ext_on = MM_FALSE;
+static mm_u64 g_ext_low = 0u;
 static mm_bool g_pio_trace;
 static mm_bool g_trace_checked;
 
@@ -336,6 +341,7 @@ static void pio_pads_refresh(void)
         undriven = ext_valid & ~(driven | g_sio_oe);
         level = (level & ~undriven) | (ext_level & undriven);
     }
+    if (g_ext_on) level &= ~g_ext_low;        /* an open-drain device wins */
     g_pad_level = level;
     g_pads_dirty = MM_FALSE;
 }
@@ -344,6 +350,22 @@ static mm_u64 pio_pad_levels(void)
 {
     if (g_pads_dirty) pio_pads_refresh();
     return g_pad_level;
+}
+
+/* let the external device see the pads and update what it pulls low.
+ * Called after a state machine cycle, never from inside one: the instruction
+ * that makes an edge still samples the levels from before the device reacted
+ * (the device's hold time; pio_i2c tests SDA for the ACK in the very cycle
+ * that takes SCL low). */
+static void pio_ext_step(void)
+{
+    mm_u32 guard;
+    for (guard = 0; guard < 4u; ++guard) {
+        mm_u64 low = mm_rp2350_ina219_pads(pio_pad_levels());
+        if (low == g_ext_low) break;
+        g_ext_low = low;
+        g_pads_dirty = MM_TRUE;
+    }
 }
 
 void mm_rp2350_pio_pad_state(mm_u32 *out_lo, mm_u32 *out_hi, mm_u32 *oe_lo, mm_u32 *oe_hi)
@@ -1293,6 +1315,8 @@ void mm_rp2350_pio_reset(void)
     g_sio_oe = 0u;
     g_pad_level = 0u;
     g_pads_dirty = MM_TRUE;
+    g_ext_on = mm_rp2350_ina219_enabled();
+    g_ext_low = 0u;
 }
 
 void mm_rp2350_pio_bind_nvic(struct mm_nvic *nvic)
@@ -1377,6 +1401,7 @@ static void pio_run_cycles(mm_u64 cycles, mm_u32 active)
                 if (!sm_clock_tick(&b->sm[smi])) continue;
                 if ((b->sm_enable & (1u << smi)) == 0u) continue;
                 sm_cycle(b, smi);
+                if (g_ext_on) pio_ext_step();
             }
         }
         /* once every enabled state machine has sat stalled with no

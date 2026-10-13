@@ -4042,6 +4042,7 @@ int main(int argc, char **argv)
     size_t spiflash_boot_size = 0;
     mm_u32 spiflash_boot_base = 0;
     mm_bool opt_disable_tb = (disable_tb_env != 0);
+    mm_bool probe_fn = mm_rp2350_probe_fn_on(); /* M33MU_PROBE_FN */
 
     snprintf(usb_udc, sizeof(usb_udc), "dummy_udc.0");
     if (!mm_execution_state_init(&execution)) {
@@ -6333,6 +6334,8 @@ handle_pending:
                             ops_executed = 0;
 
                             execution.cores[0].cpu.r[13] = mm_cpu_get_active_sp(&execution.cores[0].cpu);
+                            /* M33MU_PROBE_FN (function entry/return times) */
+                            if (probe_fn) mm_rp2350_probe_fn_check(execution.cores[0].cpu.r[15], execution.cores[0].cpu.r[14], execution.cores[0].cpu.r[13]);
 
                             (void)mm_execution_state_signal_check_trigger(
                                 &execution,
@@ -6503,6 +6506,7 @@ handle_pending:
                      * operate on the correct stack memory.
                      */
                     execution.cores[0].cpu.r[13] = mm_cpu_get_active_sp(&execution.cores[0].cpu);
+                    if (probe_fn) mm_rp2350_probe_fn_check(execution.cores[0].cpu.r[15], execution.cores[0].cpu.r[14], execution.cores[0].cpu.r[13]);
 
                     if (!g_record_started && g_record_start_set &&
                         ((execution.cores[0].cpu.r[15] & ~1u) == g_record_start_pc)) {

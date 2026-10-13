@@ -61,6 +61,15 @@ struct rp2350_timer {
 static struct rp2350_timer g_timers[2];
 static struct mm_nvic *g_nvic = 0;
 static mm_u64 g_cycle_accum = 0;
+/* system clock cycles since the emulator started.  One time base for
+ * the optional device models and probes (PCAL6416A, the I2C0 master engine,
+ * M33MU_PROBE_*); t_us in their logs is this divided by cycles per us. */
+static mm_u64 g_cycles_total = 0;
+
+mm_u64 mm_rp2350_now_cycles(void)
+{
+    return g_cycles_total;
+}
 static mm_bool g_timer_trace = MM_FALSE;
 
 static mm_u32 apply_write(mm_u32 cur, mm_u32 offset_in_reg, mm_u32 size_bytes, mm_u32 value)
@@ -438,6 +447,7 @@ void mm_rp2350_timers_tick(mm_u64 cycles)
     mm_u64 inc;
     int i;
 
+    g_cycles_total += cycles;
     mm_rp2350_ina219_tick(cycles);
     mm_rp2350_pio_tick(cycles);
     mm_rp2350_pl011_tick(cycles);

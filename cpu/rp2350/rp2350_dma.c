@@ -18,6 +18,7 @@
 #include "rp2350/rp2350_mmio.h"
 #include "rp2350/rp2350_pio.h"
 #include "rp2350/rp2350_dma.h"
+#include "rp2350/rp2350_extra.h"
 #include "m33mu/mmio.h"
 #include "m33mu/memmap.h"
 
@@ -130,6 +131,17 @@ static void dma_run(mm_u32 c)
     mm_u32 n = ch->count & 0x0fffffffu;
     mm_u32 chain = (ch->ctrl >> 13) & 0xfu;
     mm_u32 i;
+    /* M33MU_PROBE_DMA_PIO, destination PIOn TXFm (0x502/503/504x_xx10..1c) */
+    mm_u32 probe_dst = ch->write_addr;
+    mm_u32 probe_words[32];
+    mm_u32 probe_n = 0u;
+    mm_bool probe = MM_FALSE;
+    if (mm_rp2350_probe_dma_on()) {
+        mm_u32 blk = probe_dst & 0xfff00000u;
+        mm_u32 off = probe_dst & 0x000fffffu;
+        probe = ((blk == 0x50200000u || blk == 0x50300000u || blk == 0x50400000u) && off >= 0x10u && off < 0x20u)
+                    ? MM_TRUE : MM_FALSE;
+    }
 
     if (mode == 0xfu) {
         /* endless: run one reload's worth so the CPU makes progress */
@@ -145,12 +157,14 @@ static void dma_run(mm_u32 c)
         (void)mm_rp2350_pio_dreq_wait(ch->write_addr, MM_TRUE);
         (void)mm_memmap_read(map, MM_SECURE, ch->read_addr, step, &v);
         if (ch->ctrl & CTRL_BSWAP) v = bswap_val(v, step);
+        if (probe && probe_n < 32u) probe_words[probe_n++] = v;
         (void)mm_memmap_write(map, MM_SECURE, ch->write_addr, step, v);
         ch->read_addr = next_addr(ch->read_addr, step, ir, irr, ring, !ring_w);
         ch->write_addr = next_addr(ch->write_addr, step, iw, iwr, ring, ring_w);
         if ((ch->ctrl & CTRL_EN) == 0u) break; /* aborted from a side effect */
     }
     ch->transfers += i;
+    if (probe) mm_rp2350_probe_dma(c, probe_dst, step, probe_words, probe_n, i);
     ch->count = (mode == 0xfu) ? ch->count : 0u;
     ch->ctrl &= ~CTRL_BUSY;
     if ((ch->ctrl & CTRL_IRQ_QUIET) == 0u) {

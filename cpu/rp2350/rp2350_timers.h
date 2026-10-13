@@ -13,5 +13,7 @@ struct mm_nvic;
 void mm_rp2350_timers_init(struct mmio_bus *bus, struct mm_nvic *nvic);
 void mm_rp2350_timers_reset(void);
 void mm_rp2350_timers_tick(mm_u64 cycles);
+/* system clock cycles since start (time base of the device models). */
+mm_u64 mm_rp2350_now_cycles(void);
 
 #endif /* M33MU_CPU_RP2350_TIMERS_H */

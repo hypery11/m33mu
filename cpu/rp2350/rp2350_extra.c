@@ -16,12 +16,17 @@
  *     rom_get_partition_table_info() / rom_get_boot_info() answer like the
  *     real bootrom.  The image itself stays at flash offset 0 (no ATRANS).
  *   - SEGGER RTT: M33MU_RTT=<file|-> drains up-buffer 0 to a file/stdout.
+ *   - optional, off by default: a master engine for a DW_apb_i2c instance
+ *     that has a slave model attached (PCAL6416A, M33MU_PCAL6416=1), and
+ *     measurement probes (M33MU_PROBE_LOG / _FN / _DMA_PIO).
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "rp2350/rp2350_mmio.h"
 #include "rp2350/rp2350_extra.h"
+#include "rp2350/rp2350_pcal6416.h"
+#include "rp2350/rp2350_timers.h"
 #include "m33mu/mmio.h"
 #include "m33mu/memmap.h"
 #include "m33mu/cpu.h"
@@ -170,13 +175,303 @@ struct dw_i2c {
     mm_u32 abrt_source;
     mm_bool logged;
     mm_u64 nacks;
+    /* master engine, only used while a slave model is attached (dev) */
+    mm_bool dev;
+    mm_u32 reset_bit;    /* RESETS bit of this block */
+    mm_u16 txf[16];
+    mm_u32 tx_head, tx_n;
+    mm_u8 rxf[16];
+    mm_u32 rx_head, rx_n;
+    mm_u8 phase;
+    mm_u64 phase_end;
+    mm_u16 cur;          /* command being shifted */
+    mm_bool in_xfer;     /* START sent, STOP not yet: the master holds the bus */
+    mm_bool xfer_read;
+    mm_u64 n_start, n_tx, n_rx, n_stop, n_cut;
 };
 
-static struct dw_i2c g_i2c[2] = {{"I2C0", {0}, 0, 0, MM_FALSE, 0}, {"I2C1", {0}, 0, 0, MM_FALSE, 0}};
+static struct dw_i2c g_i2c[2] = {{.name = "I2C0"}, {.name = "I2C1"}};
+
+/*
+ * master engine for a bus with a slave model on it.
+ *
+ * Without a model (the default) the code further down is used unchanged:
+ * every transfer aborts at once with ABRT_7B_ADDR_NOACK.  With a model the
+ * instance becomes what pico-sdk's i2c_write_blocking / i2c_read_blocking
+ * need from a DW_apb_i2c master:
+ *   IC_DATA_CMD   16-entry TX FIFO of data + CMD/STOP/RESTART, 16-entry RX FIFO
+ *   bus           START + address (10 bit times), one byte + ACK (9), STOP (1);
+ *                 a bit time is IC_xS_SCL_HCNT + IC_xS_SCL_LCNT system clock
+ *                 cycles.  A command without STOP leaves the bus held; the
+ *                 next one continues, or starts over with a repeated START
+ *                 when it has RESTART set or changes direction.
+ *   interrupts    raw status only: TX_EMPTY (with IC_CON.TX_EMPTY_CTRL: FIFO
+ *                 at or below IC_TX_TL and the last byte shifted out),
+ *                 RX_FULL, TX_ABRT with IC_TX_ABRT_SOURCE (7B_ADDR_NOACK,
+ *                 TXDATA_NOACK), STOP_DET, START_DET, RX_UNDER/RX_OVER/
+ *                 TX_OVER, and their clear-on-read registers.  No IRQ line.
+ *   IC_ENABLE     0 flushes both FIFOs; the bus stays held if it was (the SDK
+ *                 clears and sets it around IC_TAR between the two halves of
+ *                 a write-then-read)
+ *   RESETS        asserting the block reset clears the register file (zeros,
+ *                 not the documented reset values: i2c_init() writes every
+ *                 register it relies on) and all state; registers ignore
+ *                 writes while the reset is held
+ * Not there: slave mode, 10-bit and general-call addressing, high speed,
+ * SDA hold / spike / set-up counts, clock stretching and SCL low time-outs,
+ * arbitration, the IRQ and DMA request lines, IC_ENABLE.ABORT, the exact
+ * SCL period formula (the real block adds a few cycles per phase).
+ */
+#define IC_SS_SCL_HCNT 0x14u
+#define IC_SS_SCL_LCNT 0x18u
+#define IC_FS_SCL_HCNT 0x1cu
+#define IC_FS_SCL_LCNT 0x20u
+#define IC_RX_TL       0x38u
+#define IC_TX_TL       0x3cu
+#define IC_CLR_RX_UNDER 0x44u
+#define IC_CLR_RX_OVER  0x48u
+#define IC_CLR_TX_OVER  0x4cu
+
+#define RAW_RX_UNDER (1u << 0)
+#define RAW_RX_OVER  (1u << 1)
+#define RAW_RX_FULL  (1u << 2)
+#define RAW_TX_OVER  (1u << 3)
+
+#define CMD_READ    (1u << 8)
+#define CMD_STOP    (1u << 9)
+#define CMD_RESTART (1u << 10)
+
+enum { PH_IDLE = 0, PH_ADDR, PH_DATA, PH_STOP };
+
+static mm_bool g_i2c_dev_any = MM_FALSE;
+
+static mm_u64 i2c_bit_cycles(const struct dw_i2c *c)
+{
+    mm_bool std = (((c->regs[IC_CON / 4u] >> 1) & 3u) == 1u) ? MM_TRUE : MM_FALSE;
+    mm_u64 bit = (mm_u64)(c->regs[(std ? IC_SS_SCL_HCNT : IC_FS_SCL_HCNT) / 4u] & 0xffffu) +
+                 (mm_u64)(c->regs[(std ? IC_SS_SCL_LCNT : IC_FS_SCL_LCNT) / 4u] & 0xffffu);
+    return (bit < 16u) ? 16u : bit;
+}
+
+static void i2c_eng_abort(struct dw_i2c *c, mm_u32 source, mm_u64 t)
+{
+    c->abrt_source |= source;
+    c->raw |= RAW_TX_ABRT;
+    c->tx_n = 0u; /* the TX FIFO is flushed and stays so until CLR_TX_ABRT */
+    c->phase = PH_STOP; /* the master issues a STOP on an abort */
+    c->phase_end = t + i2c_bit_cycles(c);
+}
+
+/* Advance the bus up to the current time. */
+static void i2c_eng_run(struct dw_i2c *c)
+{
+    mm_u64 now = mm_rp2350_now_cycles();
+    mm_u64 t = now; /* when an idle master takes the next command */
+
+    for (;;) {
+        mm_u64 bit = i2c_bit_cycles(c);
+        mm_bool rd = (c->cur & CMD_READ) ? MM_TRUE : MM_FALSE;
+        if (c->phase == PH_IDLE) {
+            if (c->tx_n == 0u || (c->regs[IC_ENABLE / 4u] & 1u) == 0u || (c->regs[IC_CON / 4u] & 1u) == 0u) return;
+            c->cur = c->txf[c->tx_head];
+            c->tx_head = (c->tx_head + 1u) & 15u;
+            c->tx_n--;
+            rd = (c->cur & CMD_READ) ? MM_TRUE : MM_FALSE;
+            if (!c->in_xfer || (c->cur & CMD_RESTART) != 0u || rd != c->xfer_read) {
+                c->phase = PH_ADDR;
+                c->phase_end = t + 10u * bit;
+            } else {
+                c->phase = PH_DATA;
+                c->phase_end = t + 9u * bit;
+            }
+            continue;
+        }
+        if (now < c->phase_end) return;
+        t = c->phase_end;
+        if (c->phase == PH_ADDR) {
+            mm_bool ack = mm_rp2350_pcal6416_start(t, c->regs[IC_TAR / 4u] & 0x7fu, rd);
+            c->n_start++;
+            c->raw |= RAW_START_DET;
+            c->in_xfer = MM_TRUE;
+            c->xfer_read = rd;
+            if (!ack) {
+                c->nacks++;
+                i2c_eng_abort(c, 1u << 0, t); /* ABRT_7B_ADDR_NOACK */
+            } else {
+                c->phase = PH_DATA;
+                c->phase_end = t + 9u * bit;
+            }
+        } else if (c->phase == PH_DATA) {
+            if (rd) {
+                mm_u8 b = mm_rp2350_pcal6416_read(t, (c->cur & CMD_STOP) ? MM_FALSE : MM_TRUE);
+                c->n_rx++;
+                if (c->rx_n < 16u) {
+                    c->rxf[(c->rx_head + c->rx_n) & 15u] = b;
+                    c->rx_n++;
+                } else {
+                    c->raw |= RAW_RX_OVER;
+                }
+            } else {
+                c->n_tx++;
+                if (!mm_rp2350_pcal6416_write(t, (mm_u8)(c->cur & 0xffu))) {
+                    i2c_eng_abort(c, 1u << 3, t); /* ABRT_TXDATA_NOACK */
+                    continue;
+                }
+            }
+            if ((c->cur & CMD_STOP) != 0u) {
+                c->phase = PH_STOP;
+                c->phase_end = t + bit;
+            } else {
+                c->phase = PH_IDLE;
+            }
+        } else { /* PH_STOP */
+            mm_rp2350_pcal6416_stop(t);
+            c->n_stop++;
+            c->in_xfer = MM_FALSE;
+            c->raw |= RAW_STOP_DET;
+            c->phase = PH_IDLE;
+        }
+    }
+}
+
+/* The block is disabled or reset: nothing more is shifted. */
+static void i2c_eng_halt(struct dw_i2c *c, mm_bool release_bus)
+{
+    mm_u64 now = mm_rp2350_now_cycles();
+    i2c_eng_run(c);
+    if (c->phase == PH_STOP) {
+        /* the STOP of a finished transfer still goes out */
+        mm_rp2350_pcal6416_stop(now);
+        c->n_stop++;
+        c->in_xfer = MM_FALSE;
+        c->raw |= RAW_STOP_DET;
+    } else if (c->phase != PH_IDLE || (release_bus && c->in_xfer)) {
+        /* cut off inside a byte, or reset while holding the bus */
+        c->n_cut++;
+        printf("[I2C] %s: %s with a transfer in progress (phase %u), bus released\n", c->name,
+               release_bus ? "block reset" : "disabled", (unsigned)c->phase);
+        mm_rp2350_pcal6416_stop(now);
+        c->in_xfer = MM_FALSE;
+    }
+    c->phase = PH_IDLE;
+    c->tx_n = 0u;
+    c->tx_head = 0u;
+    c->rx_n = 0u;
+    c->rx_head = 0u;
+}
+
+static mm_u32 i2c_eng_raw(const struct dw_i2c *c)
+{
+    mm_u32 raw = c->raw & ~(RAW_TX_EMPTY | RAW_RX_FULL);
+    mm_bool shifting = (c->phase == PH_ADDR || c->phase == PH_DATA) ? MM_TRUE : MM_FALSE;
+    if (c->tx_n <= (c->regs[IC_TX_TL / 4u] & 0xffu) &&
+        ((c->regs[IC_CON / 4u] & (1u << 8)) == 0u || !shifting)) {
+        raw |= RAW_TX_EMPTY;
+    }
+    if (c->rx_n > (c->regs[IC_RX_TL / 4u] & 0xffu)) raw |= RAW_RX_FULL;
+    return raw;
+}
+
+static mm_u32 i2c_eng_reg_read(struct dw_i2c *c, mm_u32 off)
+{
+    mm_bool peek = mmio_peek_mode();
+    if (mm_rp2350_reset_asserted(c->reset_bit)) return 0u;
+    i2c_eng_run(c);
+    switch (off) {
+    case IC_RAW_INTR_STAT: return i2c_eng_raw(c);
+    case IC_INTR_STAT: return i2c_eng_raw(c) & c->regs[IC_INTR_MASK / 4u];
+    case IC_TX_ABRT_SOURCE: return c->abrt_source;
+    case IC_CLR_INTR:
+        if (!peek) { c->raw = 0u; c->abrt_source = 0u; }
+        return 0u;
+    case IC_CLR_RX_UNDER:
+        if (!peek) c->raw &= ~RAW_RX_UNDER;
+        return 0u;
+    case IC_CLR_RX_OVER:
+        if (!peek) c->raw &= ~RAW_RX_OVER;
+        return 0u;
+    case IC_CLR_TX_OVER:
+        if (!peek) c->raw &= ~RAW_TX_OVER;
+        return 0u;
+    case IC_CLR_TX_ABRT:
+        if (!peek) { c->raw &= ~RAW_TX_ABRT; c->abrt_source = 0u; }
+        return 0u;
+    case IC_CLR_STOP_DET:
+        if (!peek) c->raw &= ~RAW_STOP_DET;
+        return 0u;
+    case IC_CLR_START_DET:
+        if (!peek) c->raw &= ~RAW_START_DET;
+        return 0u;
+    case IC_STATUS:
+        return ((c->phase != PH_IDLE) ? ((1u << 0) | (1u << 5)) : 0u) | /* ACTIVITY | MST_ACTIVITY */
+               ((c->tx_n < 16u) ? (1u << 1) : 0u) |                      /* TFNF */
+               ((c->tx_n == 0u) ? (1u << 2) : 0u) |                      /* TFE */
+               ((c->rx_n != 0u) ? (1u << 3) : 0u) |                      /* RFNE */
+               ((c->rx_n == 16u) ? (1u << 4) : 0u);                      /* RFF */
+    case IC_TXFLR: return c->tx_n;
+    case IC_RXFLR: return c->rx_n;
+    case IC_DATA_CMD: {
+        mm_u32 v;
+        if (c->rx_n == 0u) {
+            if (!peek) c->raw |= RAW_RX_UNDER;
+            return 0u;
+        }
+        v = c->rxf[c->rx_head];
+        if (!peek) {
+            c->rx_head = (c->rx_head + 1u) & 15u;
+            c->rx_n--;
+        }
+        return v;
+    }
+    case IC_ENABLE_STATUS: return c->regs[IC_ENABLE / 4u] & 1u;
+    case IC_COMP_PARAM_1: return 0x000f0fefu; /* 16-deep FIFOs */
+    case IC_COMP_VERSION: return 0x3230312au;
+    case IC_COMP_TYPE: return 0x44570140u;
+    default:
+        if (off >= 0x40u && off <= 0x68u) return 0u; /* other clear-on-read */
+        return c->regs[(off & 0xffu) / 4u];
+    }
+}
+
+static void i2c_eng_reg_write(struct dw_i2c *c, mm_u32 off, mm_u32 v)
+{
+    if (mm_rp2350_reset_asserted(c->reset_bit)) return;
+    i2c_eng_run(c);
+    if (off == IC_DATA_CMD) {
+        if ((c->regs[IC_ENABLE / 4u] & 1u) == 0u) return;
+        if ((c->raw & RAW_TX_ABRT) != 0u) return; /* FIFO held flushed until CLR_TX_ABRT */
+        if (c->tx_n >= 16u) {
+            c->raw |= RAW_TX_OVER;
+            return;
+        }
+        c->txf[(c->tx_head + c->tx_n) & 15u] = (mm_u16)(v & 0x7ffu);
+        c->tx_n++;
+        i2c_eng_run(c);
+        return;
+    }
+    if (off == IC_ENABLE) {
+        mm_u32 old = c->regs[IC_ENABLE / 4u];
+        c->regs[IC_ENABLE / 4u] = v;
+        if ((old & 1u) != 0u && (v & 1u) == 0u) i2c_eng_halt(c, MM_FALSE);
+        return;
+    }
+    if (off < 0x100u) c->regs[off / 4u] = v;
+}
+
+void mm_rp2350_extra_i2c_reset(mm_u32 index)
+{
+    struct dw_i2c *c = &g_i2c[index & 1u];
+    if (!c->dev) return; /* the empty-bus model keeps its registers, as before */
+    i2c_eng_halt(c, MM_TRUE);
+    memset(c->regs, 0, sizeof(c->regs));
+    c->raw = 0u;
+    c->abrt_source = 0u;
+}
 
 static mm_u32 i2c_reg_read(struct dw_i2c *c, mm_u32 off)
 {
     mm_u32 v;
+    if (c->dev) return i2c_eng_reg_read(c, off); /* slave model attached */
     switch (off) {
     case IC_RAW_INTR_STAT: return c->raw | RAW_TX_EMPTY;
     case IC_INTR_STAT: return (c->raw | RAW_TX_EMPTY) & c->regs[IC_INTR_MASK / 4u];
@@ -210,6 +505,7 @@ static mm_u32 i2c_reg_read(struct dw_i2c *c, mm_u32 off)
 
 static void i2c_reg_write(struct dw_i2c *c, mm_u32 off, mm_u32 v)
 {
+    if (c->dev) { i2c_eng_reg_write(c, off, v); return; } /* slave model attached */
     if (off == IC_DATA_CMD) {
         if ((c->regs[IC_ENABLE / 4u] & 1u) != 0u && (c->regs[IC_CON / 4u] & 1u) != 0u) {
             /* master: nobody acknowledges the address */
@@ -581,8 +877,172 @@ static void pc_report(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* measurement probes, all off unless M33MU_PROBE_LOG is set     */
+/* ------------------------------------------------------------------ */
+/*
+ *   M33MU_PROBE_LOG=<file|->        where the lines go; nothing below is
+ *                                   active without it
+ *   M33MU_PROBE_FN=<addr>=<name>,.. log entry and return of the functions at
+ *                                   these addresses with the time between
+ *                                   them.  The entry is seen when a basic
+ *                                   block starts at <addr>, the return when
+ *                                   execution reaches the LR of the entry
+ *                                   with the SP of the entry.  The time
+ *                                   includes whatever preempted the thread
+ *                                   and every sleep inside the function.
+ *                                   For a function entered as an exception
+ *                                   handler only the entry is logged.
+ *   M33MU_PROBE_DMA_PIO=1           log every DMA run whose destination is a
+ *                                   PIO TX FIFO, with the words written
+ * t_us is the same clock as in the device model logs.
+ */
+#define PROBE_FN_MAX 8u
+#define PROBE_FRAME_MAX 16u
+
+static struct {
+    int state; /* 0 = environment not read, 1 = on, -1 = off */
+    FILE *log;
+    mm_bool dma_pio;
+    mm_u32 fn_n;
+    mm_u32 fn_addr[PROBE_FN_MAX];
+    char fn_name[PROBE_FN_MAX][40];
+    struct {
+        mm_bool used;
+        mm_u32 fn;
+        mm_u32 ret;
+        mm_u32 sp;
+        mm_u64 t0;
+    } frame[PROBE_FRAME_MAX];
+    mm_u64 n_enter, n_exit, n_dma;
+} g_probe;
+
+static mm_u64 probe_us(mm_u64 cycles)
+{
+    mm_u64 per_us = mm_rp2350_cpu_hz() / 1000000ull;
+    return cycles / (per_us ? per_us : 1u);
+}
+
+static void probe_load_env(void)
+{
+    const char *path = getenv("M33MU_PROBE_LOG");
+    const char *fn = getenv("M33MU_PROBE_FN");
+    const char *dma = getenv("M33MU_PROBE_DMA_PIO");
+    g_probe.state = -1;
+    if (path == 0 || path[0] == '\0') return;
+    g_probe.log = (strcmp(path, "-") == 0) ? stdout : fopen(path, "w");
+    if (g_probe.log == 0) g_probe.log = stdout;
+    g_probe.state = 1;
+    g_probe.dma_pio = (dma != 0 && dma[0] != '\0' && strcmp(dma, "0") != 0) ? MM_TRUE : MM_FALSE;
+    while (fn != 0 && *fn != '\0' && g_probe.fn_n < PROBE_FN_MAX) {
+        char *end = 0;
+        mm_u32 addr = (mm_u32)strtoul(fn, &end, 0);
+        mm_u32 k = 0u;
+        if (end == fn) break;
+        g_probe.fn_addr[g_probe.fn_n] = addr & ~1u;
+        if (*end == '=') {
+            ++end;
+            while (*end != '\0' && *end != ',' && k + 1u < sizeof(g_probe.fn_name[0])) g_probe.fn_name[g_probe.fn_n][k++] = *end++;
+        }
+        g_probe.fn_name[g_probe.fn_n][k] = '\0';
+        if (k == 0u) snprintf(g_probe.fn_name[g_probe.fn_n], sizeof(g_probe.fn_name[0]), "0x%08x", addr & ~1u);
+        g_probe.fn_n++;
+        while (*end != '\0' && *end != ',') ++end;
+        fn = (*end == ',') ? end + 1 : end;
+    }
+    fprintf(g_probe.log, "# m33mu probes (emulated time, t_us = system clock cycles / %llu):",
+            (unsigned long long)(mm_rp2350_cpu_hz() / 1000000ull));
+    {
+        mm_u32 i;
+        for (i = 0; i < g_probe.fn_n; ++i) fprintf(g_probe.log, " fn 0x%08x=%s", g_probe.fn_addr[i], g_probe.fn_name[i]);
+    }
+    fprintf(g_probe.log, "%s\n", g_probe.dma_pio ? " dma->pio" : "");
+    fflush(g_probe.log);
+}
+
+mm_bool mm_rp2350_probe_fn_on(void)
+{
+    if (g_probe.state == 0) probe_load_env();
+    return (g_probe.state > 0 && g_probe.fn_n != 0u) ? MM_TRUE : MM_FALSE;
+}
+
+/* Called by the CPU loop at the start of every basic block / instruction. */
+void mm_rp2350_probe_fn_check(mm_u32 pc, mm_u32 lr, mm_u32 sp)
+{
+    mm_u32 i;
+    mm_u64 now = mm_rp2350_now_cycles();
+    pc &= ~1u;
+    for (i = 0; i < PROBE_FRAME_MAX; ++i) {
+        if (g_probe.frame[i].used && g_probe.frame[i].ret == pc && g_probe.frame[i].sp == sp) {
+            mm_u64 d = now - g_probe.frame[i].t0;
+            g_probe.frame[i].used = MM_FALSE;
+            g_probe.n_exit++;
+            fprintf(g_probe.log, "t_us=%-10llu EXIT  %s dur_us=%llu dur_cycles=%llu\n",
+                    (unsigned long long)probe_us(now), g_probe.fn_name[g_probe.frame[i].fn],
+                    (unsigned long long)probe_us(d), (unsigned long long)d);
+            fflush(g_probe.log);
+        }
+    }
+    for (i = 0; i < g_probe.fn_n; ++i) {
+        mm_u32 k, slot = PROBE_FRAME_MAX;
+        if (g_probe.fn_addr[i] != pc) continue;
+        for (k = 0; k < PROBE_FRAME_MAX; ++k) {
+            if (g_probe.frame[k].used && g_probe.frame[k].fn == i && g_probe.frame[k].sp == sp &&
+                g_probe.frame[k].ret == (lr & ~1u)) {
+                slot = PROBE_FRAME_MAX + 1u; /* the same activation, seen again */
+                break;
+            }
+            if (!g_probe.frame[k].used && slot == PROBE_FRAME_MAX) slot = k;
+        }
+        if (slot > PROBE_FRAME_MAX) continue;
+        if ((lr & 0xff000000u) == 0xff000000u) {
+            /* entered as an exception handler: LR is an EXC_RETURN value, no
+             * block ever starts there, so only the entry can be logged */
+            g_probe.n_enter++;
+            fprintf(g_probe.log, "t_us=%-10llu ENTER %s sp=0x%08x lr=0x%08x (exception entry, return not tracked)\n",
+                    (unsigned long long)probe_us(now), g_probe.fn_name[i], sp, lr);
+            fflush(g_probe.log);
+            continue;
+        }
+        g_probe.n_enter++;
+        fprintf(g_probe.log, "t_us=%-10llu ENTER %s sp=0x%08x lr=0x%08x%s\n", (unsigned long long)probe_us(now),
+                g_probe.fn_name[i], sp, lr, (slot == PROBE_FRAME_MAX) ? " (no free slot, return not tracked)" : "");
+        fflush(g_probe.log);
+        if (slot == PROBE_FRAME_MAX) continue;
+        g_probe.frame[slot].used = MM_TRUE;
+        g_probe.frame[slot].fn = i;
+        g_probe.frame[slot].ret = lr & ~1u;
+        g_probe.frame[slot].sp = sp;
+        g_probe.frame[slot].t0 = now;
+    }
+}
+
+mm_bool mm_rp2350_probe_dma_on(void)
+{
+    if (g_probe.state == 0) probe_load_env();
+    return (g_probe.state > 0 && g_probe.dma_pio) ? MM_TRUE : MM_FALSE;
+}
+
+/* One DMA run into a PIO TX FIFO: `words` are the values written. */
+void mm_rp2350_probe_dma(mm_u32 ch, mm_u32 dst, mm_u32 step, const mm_u32 *words, mm_u32 n, mm_u32 n_total)
+{
+    mm_u32 i;
+    mm_u32 pio = (dst - 0x50200000u) / 0x00100000u;
+    mm_u32 sm = ((dst & 0xfffu) - 0x10u) / 4u;
+    g_probe.n_dma++;
+    fprintf(g_probe.log, "t_us=%-10llu DMA   ch=%u -> PIO%u.TXF%u n=%u x %uB data=",
+            (unsigned long long)probe_us(mm_rp2350_now_cycles()), ch, pio, sm, n_total, step);
+    for (i = 0; i < n; ++i) fprintf(g_probe.log, "%s%0*x", i ? " " : "", (int)(step * 2u), words[i]);
+    fprintf(g_probe.log, "%s\n", (n < n_total) ? " ..." : "");
+    fflush(g_probe.log);
+}
+
 void mm_rp2350_extra_tick(mm_u64 cycles)
 {
+    if (g_i2c_dev_any) { /* keep a bus with a slave model moving */
+        if (g_i2c[0].dev && g_i2c[0].phase != PH_IDLE) i2c_eng_run(&g_i2c[0]);
+        if (g_i2c[1].dev && g_i2c[1].phase != PH_IDLE) i2c_eng_run(&g_i2c[1]);
+    }
     if (g_pcs_every) pc_sample(cycles);
     if (!g_rtt_enabled) return;
     g_rtt_cycles += cycles;
@@ -632,6 +1092,12 @@ mm_bool mm_rp2350_extra_register(struct mmio_bus *bus)
         reg.write = xip_alias_write;
         (void)mmio_bus_register_region(bus, &reg);
     }
+    g_i2c[0].reset_bit = 1u << 4;
+    g_i2c[1].reset_bit = 1u << 5;
+    if (mm_rp2350_pcal6416_enabled()) { /* slave model on one of the buses */
+        g_i2c[mm_rp2350_pcal6416_bus() & 1u].dev = MM_TRUE;
+        g_i2c_dev_any = MM_TRUE;
+    }
     {
         const char *pcs = getenv("M33MU_PC_SAMPLE");
         const char *rtt = getenv("M33MU_RTT");
@@ -674,5 +1140,20 @@ void mm_rp2350_extra_stats(void)
     if (g_i2c[0].nacks || g_i2c[1].nacks) {
         fprintf(stderr, "[I2C] NACKed transfers: I2C0=%llu I2C1=%llu\n",
                 (unsigned long long)g_i2c[0].nacks, (unsigned long long)g_i2c[1].nacks);
+    }
+    {
+        mm_u32 i;
+        for (i = 0; i < 2u; ++i) {
+            const struct dw_i2c *c = &g_i2c[i];
+            if (!c->dev) continue;
+            fprintf(stderr, "[I2C] %s master engine: starts=%llu bytes_tx=%llu bytes_rx=%llu stops=%llu cut_short=%llu\n",
+                    c->name, (unsigned long long)c->n_start, (unsigned long long)c->n_tx,
+                    (unsigned long long)c->n_rx, (unsigned long long)c->n_stop, (unsigned long long)c->n_cut);
+        }
+    }
+    if (g_probe.state > 0) {
+        fprintf(stderr, "[PROBE] fn_enter=%llu fn_exit=%llu dma_pio=%llu\n", (unsigned long long)g_probe.n_enter,
+                (unsigned long long)g_probe.n_exit, (unsigned long long)g_probe.n_dma);
+        if (g_probe.log != 0 && g_probe.log != stdout) fflush(g_probe.log);
     }
 }

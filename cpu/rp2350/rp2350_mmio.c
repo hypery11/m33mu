@@ -9,6 +9,7 @@
 #include "rp2350/cpu_config.h"
 #include "rp2350/rp2350_mmio.h"
 #include "rp2350/rp2350_extra.h"
+#include "rp2350/rp2350_pcal6416.h"
 #include "rp2350/rp2350_dma.h"
 #include "rp2350/rp2350_pio.h"
 #include "rp2350/rp2350_usb.h"
@@ -1371,6 +1372,15 @@ static void sio_sync_inputs(void)
                 ((mm_u32)pu & ~sio.oe_lo & ~oe_lo);
     sio.in_hi = (sio.out_hi & sio.oe_hi & ~oe_hi) | (pio_hi & oe_hi) |
                 ((mm_u32)(pu >> 32) & ~sio.oe_hi & ~oe_hi);
+    /* pads an external device model holds (the INT line of the
+     * PCAL6416A model with its pull-up, M33MU_PCAL6416=1) */
+    if (mm_rp2350_pcal6416_enabled()) {
+        mm_u64 high = 0u;
+        mm_u64 low = 0u;
+        mm_rp2350_pcal6416_pads(&high, &low);
+        sio.in_lo = (sio.in_lo | ((mm_u32)high & ~sio.oe_lo & ~oe_lo)) & ~(mm_u32)low;
+        sio.in_hi = (sio.in_hi | ((mm_u32)(high >> 32) & ~sio.oe_hi & ~oe_hi)) & ~(mm_u32)(low >> 32);
+    }
     if (g_ext_valid != 0u) {
         /* an external circuit beats the pull */
         driven = rp2350_gpio_driven(0);
@@ -1402,23 +1412,36 @@ static mm_bool resets_read(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u3
     return MM_TRUE;
 }
 
+/* tell the I2C blocks when their reset gets asserted (a no-op unless a
+ * slave model is attached to that bus, see rp2350_extra.c). */
+static void resets_notify(mm_u32 before, mm_u32 after)
+{
+    mm_u32 rising = after & ~before;
+    if ((rising & (1u << 4)) != 0u) mm_rp2350_extra_i2c_reset(0u);
+    if ((rising & (1u << 5)) != 0u) mm_rp2350_extra_i2c_reset(1u);
+}
+
 static mm_bool resets_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u32 value)
 {
     struct reset_state *r = (struct reset_state *)opaque;
     mm_u32 alias;
     mm_u32 base_off;
     mm_u32 mask;
+    mm_u32 before;
     if (r == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
     if ((offset + size_bytes) > MMIO_ALIAS_SIZE) return MM_FALSE;
 
     base_off = alias_base_offset(offset, &alias);
     if ((base_off + size_bytes) > RESETS_SIZE) return MM_FALSE;
+    before = r->regs[RESETS_RESET / 4u];
     if (alias == 0u) {
         if (base_off == RESETS_RESET && size_bytes == 4u) {
             r->regs[RESETS_RESET / 4u] = value;
+            resets_notify(before, r->regs[RESETS_RESET / 4u]);
             return MM_TRUE;
         }
         r->regs[base_off / 4u] = apply_write(r->regs[base_off / 4u], base_off & 3u, size_bytes, value);
+        resets_notify(before, r->regs[RESETS_RESET / 4u]);
         return MM_TRUE;
     }
     mask = alias_value(base_off & 3u, size_bytes, value);
@@ -1435,6 +1458,7 @@ static mm_bool resets_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_u
     default:
         break;
     }
+    resets_notify(before, r->regs[RESETS_RESET / 4u]);
     return MM_TRUE;
 }
 

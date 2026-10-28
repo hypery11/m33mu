@@ -17,7 +17,8 @@
  *     real bootrom.  The image itself stays at flash offset 0 (no ATRANS).
  *   - SEGGER RTT: M33MU_RTT=<file|-> drains up-buffer 0 to a file/stdout.
  *   - optional, off by default: a master engine for a DW_apb_i2c instance
- *     that has a slave model attached (PCAL6416A, M33MU_PCAL6416=1), and
+ *     that has a slave model attached (PCAL6416A, M33MU_PCAL6416=1), slave
+ *     mode for I2C1 with a scripted external master (M33MU_I2C1_MASTER), and
  *     measurement probes (M33MU_PROBE_LOG / _FN / _DMA_PIO).
  */
 #include <stdio.h>
@@ -26,10 +27,12 @@
 #include "rp2350/rp2350_mmio.h"
 #include "rp2350/rp2350_extra.h"
 #include "rp2350/rp2350_pcal6416.h"
+#include "rp2350/rp2350_i2c1_master.h"
 #include "rp2350/rp2350_timers.h"
 #include "m33mu/mmio.h"
 #include "m33mu/memmap.h"
 #include "m33mu/cpu.h"
+#include "m33mu/nvic.h"
 
 /* ------------------------------------------------------------------ */
 /* generic register-file stubs                                         */
@@ -188,6 +191,22 @@ struct dw_i2c {
     mm_bool in_xfer;     /* START sent, STOP not yet: the master holds the bus */
     mm_bool xfer_read;
     mm_u64 n_start, n_tx, n_rx, n_stop, n_cut;
+    /* slave mode with an external master (slv), I2C1 only */
+    mm_bool slv;
+    mm_u8 s_txf[16];
+    mm_u32 s_tx_head, s_tx_n;
+    mm_u16 s_rxf[16];        /* data byte | FIRST_DATA_BYTE */
+    mm_u32 s_rx_head, s_rx_n;
+    mm_u8 s_state;           /* SS_* */
+    mm_bool s_repeated;      /* the START being decoded is a repeated START */
+    mm_bool s_addressed;     /* our address was seen since the last START */
+    mm_bool s_first;         /* the next byte received is the first after the address */
+    mm_bool s_rx_data;       /* a data byte was received in this write */
+    mm_bool s_rd_req;        /* RD_REQ raised for the byte the master waits for */
+    mm_u32 s_en_status;      /* IC_ENABLE_STATUS bits 2:1, latched at IC_ENABLE 1 -> 0 */
+    mm_u32 s_flush_cnt;      /* IC_TX_ABRT_SOURCE.TX_FLUSH_CNT */
+    mm_u64 s_n_start, s_n_match, s_n_other, s_n_rx, s_n_tx, s_n_rd_req, s_n_rx_done, s_n_stop;
+    mm_u64 s_n_irq, s_n_abrt, s_n_rx_over, s_n_tx_over, s_n_rx_under, s_n_locked;
 };
 
 static struct dw_i2c g_i2c[2] = {{.name = "I2C0"}, {.name = "I2C1"}};
@@ -458,9 +477,497 @@ static void i2c_eng_reg_write(struct dw_i2c *c, mm_u32 off, mm_u32 v)
     if (off < 0x100u) c->regs[off / 4u] = v;
 }
 
+/*
+ * slave mode of I2C1, with an external master on the bus.
+ *
+ * Off unless M33MU_I2C1_MASTER is set (rp2350_i2c1_master.c, a scripted
+ * master in the role of the RK3576 CPU).  Without it I2C1 is the empty-bus
+ * model further down, unchanged.  With it I2C1 is what a DW_apb_i2c slave
+ * (IC_CON.MASTER_MODE = 0, IC_SLAVE_DISABLE = 0, IC_ENABLE = 1) shows its
+ * firmware, after the RP2350 datasheet's I2C chapter and the register
+ * descriptions in pico-sdk's hardware/regs/i2c.h.  Byte level: the master
+ * reports START / repeated START, the address byte, each data byte and STOP
+ * at their emulated times (rp2350_extra.h, mm_rp2350_i2c1_bus_*).
+ *   address    7-bit compare with IC_SAR[6:0]; a match is ACKed, any other
+ *              address NACKed
+ *   receive    each byte the master writes is ACKed and goes into the 16-entry
+ *              RX FIFO (IC_DATA_CMD read, bit 11 = FIRST_DATA_BYTE).  RX FIFO
+ *              full: with IC_CON.RX_FIFO_FULL_HLD_CTRL SCL is held (clock
+ *              stretching) until there is room, without it the byte is ACKed
+ *              and lost (RX_OVER).  IC_SLV_DATA_NACK_ONLY = 1 NACKs data.
+ *   transmit   a read address flushes whatever is left in the TX FIFO
+ *              (TX_ABRT, ABRT_SLVFLUSH_TXFIFO, TX_FLUSH_CNT; the TX FIFO takes
+ *              no data until IC_CLR_TX_ABRT is read).  For each byte the
+ *              master wants while the TX FIFO is empty RD_REQ is raised and
+ *              SCL held until IC_DATA_CMD is written; bytes already in the
+ *              FIFO go out without RD_REQ.  The master's NACK sets RX_DONE.
+ *              CMD = 1 written in slave mode: TX_ABRT, ABRT_SLVRD_INTX.
+ *   interrupts RX_UNDER, RX_OVER, RX_FULL (level: IC_RXFLR > IC_RX_TL),
+ *              TX_OVER, TX_EMPTY (level: IC_TXFLR <= IC_TX_TL; TX_EMPTY_CTRL
+ *              is not looked at), RD_REQ, TX_ABRT, RX_DONE, ACTIVITY,
+ *              STOP_DET (honours STOP_DET_IFADDRESSED), START_DET (START and
+ *              repeated START, any address), RESTART_DET (repeated START
+ *              followed by our address); their IC_CLR_* read-to-clear
+ *              registers and IC_CLR_INTR.  IC_INTR_STAT = raw & IC_INTR_MASK;
+ *              its OR is the level of I2C1_IRQ (37) to the NVIC.
+ *   registers  datasheet reset values, also after every RESETS cycle;
+ *              IC_CON, IC_SAR, the SCL counts, IC_FS_SPKLEN and
+ *              IC_SLV_DATA_NACK_ONLY ignore writes while IC_ENABLE = 1;
+ *              IC_RX_TL / IC_TX_TL saturate at 15 (16 entries)
+ *   IC_ENABLE  1 -> 0 flushes both FIFOs and clears the interrupt status at
+ *              once; a transfer in progress is dropped (further data bytes
+ *              NACKed, reads find SDA released = 0xff) and IC_ENABLE_STATUS
+ *              reports SLV_DISABLED_WHILE_BUSY / SLV_RX_DATA_LOST
+ * Not there: master mode on this instance (behaves like the empty bus),
+ * 10-bit addressing, general call (address 0 is NACKed), START BYTE, SMBus,
+ * spike filter, set-up/hold times, DMA requests, arbitration, IC_ENABLE.ABORT
+ * and TX_CMD_BLOCK, the delay with which the real block goes idle after
+ * IC_ENABLE = 0, the second byte lane of IC_DATA_CMD (a byte read at 0x11
+ * pops the FIFO again).
+ */
+#define IC_SAR                0x08u
+#define IC_CLR_RD_REQ         0x50u
+#define IC_CLR_RX_DONE        0x58u
+#define IC_CLR_ACTIVITY       0x5cu
+#define IC_CLR_GEN_CALL       0x68u
+#define IC_SDA_HOLD           0x7cu
+#define IC_SLV_DATA_NACK_ONLY 0x84u
+#define IC_SDA_SETUP          0x94u
+#define IC_ACK_GENERAL_CALL   0x98u
+#define IC_FS_SPKLEN          0xa0u
+#define IC_CLR_RESTART_DET    0xa8u
+
+#define RAW_RD_REQ      (1u << 5)
+#define RAW_RX_DONE     (1u << 7)
+#define RAW_ACTIVITY    (1u << 8)
+#define RAW_GEN_CALL    (1u << 11)
+#define RAW_RESTART_DET (1u << 12)
+
+#define CON_MASTER_MODE     (1u << 0)
+#define CON_10BITADDR_SLAVE (1u << 3)
+#define CON_SLAVE_DISABLE   (1u << 6)
+#define CON_STOP_DET_IFADDR (1u << 7)
+#define CON_RX_FIFO_FULL_HLD (1u << 9)
+
+#define ABRT_SLVFLUSH_TXFIFO (1u << 13)
+#define ABRT_SLVRD_INTX      (1u << 15)
+#define DATA_FIRST_BYTE      (1u << 11)
+
+#define I2C1_IRQ 37u
+
+enum { SS_IDLE = 0, /* bus free, or the block took no part in this transfer */
+       SS_ADDR,     /* START seen, address byte expected */
+       SS_OTHER,    /* another address: waiting for STOP or repeated START */
+       SS_RX,       /* addressed, master writes */
+       SS_TX,       /* addressed, master reads */
+       SS_TX_DONE,  /* the master NACKed the last byte */
+       SS_OFF };    /* disabled or reset during the transfer: out until STOP */
+
+static mm_bool g_i2c_slv_on = MM_FALSE;
+static struct mm_nvic *g_extra_nvic = 0;
+
+#define SLV_TRACE(...) do { if (mm_rp2350_i2c1_master_tracing()) mm_rp2350_i2c1_master_trace(__VA_ARGS__); } while (0)
+
+static mm_bool slv_active(const struct dw_i2c *c)
+{
+    if (mm_rp2350_reset_asserted(c->reset_bit)) return MM_FALSE;
+    if ((c->regs[IC_ENABLE / 4u] & 1u) == 0u) return MM_FALSE;
+    return ((c->regs[IC_CON / 4u] & (CON_MASTER_MODE | CON_SLAVE_DISABLE)) == 0u) ? MM_TRUE : MM_FALSE;
+}
+
+static mm_bool slv_busy(const struct dw_i2c *c)
+{
+    return (c->s_state == SS_ADDR || c->s_state == SS_RX || c->s_state == SS_TX || c->s_state == SS_TX_DONE)
+               ? MM_TRUE : MM_FALSE;
+}
+
+static mm_u32 slv_raw(const struct dw_i2c *c)
+{
+    mm_u32 raw = c->raw & ~(RAW_RX_FULL | RAW_TX_EMPTY);
+    if ((c->regs[IC_ENABLE / 4u] & 1u) == 0u) return raw;
+    if (c->s_rx_n > c->regs[IC_RX_TL / 4u]) raw |= RAW_RX_FULL;
+    if (c->s_tx_n <= c->regs[IC_TX_TL / 4u]) raw |= RAW_TX_EMPTY;
+    return raw;
+}
+
+static void slv_flush(struct dw_i2c *c)
+{
+    c->s_tx_head = c->s_tx_n = 0u;
+    c->s_rx_head = c->s_rx_n = 0u;
+}
+
+static void slv_regs_reset(struct dw_i2c *c)
+{
+    memset(c->regs, 0, sizeof(c->regs));
+    c->regs[IC_CON / 4u] = 0x65u;
+    c->regs[IC_TAR / 4u] = 0x55u;
+    c->regs[IC_SAR / 4u] = 0x55u;
+    c->regs[IC_SS_SCL_HCNT / 4u] = 0x28u;
+    c->regs[IC_SS_SCL_LCNT / 4u] = 0x2fu;
+    c->regs[IC_FS_SCL_HCNT / 4u] = 0x06u;
+    c->regs[IC_FS_SCL_LCNT / 4u] = 0x0du;
+    c->regs[IC_INTR_MASK / 4u] = 0x8ffu;
+    c->regs[IC_SDA_HOLD / 4u] = 0x1u;
+    c->regs[IC_SDA_SETUP / 4u] = 0x64u;
+    c->regs[IC_ACK_GENERAL_CALL / 4u] = 0x1u;
+    c->regs[IC_FS_SPKLEN / 4u] = 0x7u;
+    c->raw = 0u;
+    c->abrt_source = 0u;
+    c->s_flush_cnt = 0u;
+    c->s_en_status = 0u;
+    c->s_rd_req = MM_FALSE;
+    slv_flush(c);
+    if (c->s_state != SS_IDLE) c->s_state = SS_OFF;
+}
+
+static void slv_tx_abort(struct dw_i2c *c, mm_u32 source)
+{
+    c->s_flush_cnt = (c->s_flush_cnt + c->s_tx_n) & 0x1ffu;
+    c->abrt_source |= source;
+    c->raw |= RAW_TX_ABRT;
+    slv_flush(c); /* "flushes/resets/empties the TX_FIFO and RX_FIFO" */
+    c->s_n_abrt++;
+    SLV_TRACE("TX_ABRT source=0x%05x", c->abrt_source);
+}
+
+/* The IRQ line, for the NVIC's level re-sampling (rp2350_irq_level). */
+mm_bool mm_rp2350_extra_i2c_line(mm_u32 irq)
+{
+    const struct dw_i2c *c = &g_i2c[1];
+    if (!g_i2c_slv_on || irq != I2C1_IRQ) return MM_FALSE;
+    if (mm_rp2350_reset_asserted(c->reset_bit)) return MM_FALSE;
+    if (mm_rp2350_i2c1_master_irq_held()) return MM_FALSE; /* script: irq_hold_us */
+    return (slv_raw(c) & c->regs[IC_INTR_MASK / 4u]) != 0u ? MM_TRUE : MM_FALSE;
+}
+
+void mm_rp2350_extra_set_nvic(struct mm_nvic *nvic)
+{
+    g_extra_nvic = nvic;
+}
+
+mm_u64 mm_rp2350_extra_next_event(void)
+{
+    if (!g_i2c_slv_on) return (mm_u64)-1;
+    return mm_rp2350_i2c1_master_next_event();
+}
+
+static void slv_update_irq(struct dw_i2c *c)
+{
+    mm_u32 word = I2C1_IRQ / 32u;
+    mm_u32 mask = 1u << (I2C1_IRQ % 32u);
+    if (g_extra_nvic == 0 || !mm_rp2350_extra_i2c_line(I2C1_IRQ)) return;
+    if ((g_extra_nvic->active_mask[word] & mask) != 0u) return;  /* re-sampled on exception return */
+    if ((g_extra_nvic->pending_mask[word] & mask) != 0u) return;
+    mm_nvic_set_pending(g_extra_nvic, I2C1_IRQ, MM_TRUE);
+    c->s_n_irq++;
+}
+
+/* bus side, called by the master at the time of each event */
+
+void mm_rp2350_i2c1_bus_start(mm_bool repeated)
+{
+    struct dw_i2c *c = &g_i2c[1];
+    if (!c->slv) return;
+    if (!slv_active(c)) {
+        c->s_state = SS_IDLE;
+        return;
+    }
+    c->s_n_start++;
+    c->raw |= RAW_START_DET | RAW_ACTIVITY;
+    c->s_repeated = repeated;
+    if (!repeated) c->s_addressed = MM_FALSE;
+    c->s_rd_req = MM_FALSE;
+    c->s_state = SS_ADDR;
+    SLV_TRACE("%s -> START_DET", repeated ? "Sr" : "S");
+}
+
+int mm_rp2350_i2c1_bus_addr(mm_u32 addr7, mm_bool read)
+{
+    struct dw_i2c *c = &g_i2c[1];
+    if (!c->slv || c->s_state != SS_ADDR) return MM_I2C_SLV_NACK;
+    if (!slv_active(c)) {
+        c->s_state = SS_OFF;
+        return MM_I2C_SLV_NACK;
+    }
+    if ((c->regs[IC_CON / 4u] & CON_10BITADDR_SLAVE) != 0u || addr7 != (c->regs[IC_SAR / 4u] & 0x7fu)) {
+        c->s_n_other++;
+        c->s_state = SS_OTHER;
+        SLV_TRACE("address 0x%02x%c not ours (IC_SAR=0x%03x): NACK", addr7, read ? 'R' : 'W', c->regs[IC_SAR / 4u]);
+        return MM_I2C_SLV_NACK;
+    }
+    c->s_n_match++;
+    c->s_addressed = MM_TRUE;
+    if (c->s_repeated) c->raw |= RAW_RESTART_DET;
+    if (read) {
+        if (c->s_tx_n != 0u) slv_tx_abort(c, ABRT_SLVFLUSH_TXFIFO);
+        c->s_state = SS_TX;
+    } else {
+        c->s_state = SS_RX;
+        c->s_first = MM_TRUE;
+        c->s_rx_data = MM_FALSE;
+    }
+    SLV_TRACE("address 0x%02x%c: ACK%s", addr7, read ? 'R' : 'W', c->s_repeated ? ", RESTART_DET" : "");
+    return MM_I2C_SLV_ACK;
+}
+
+int mm_rp2350_i2c1_bus_write(mm_u8 byte)
+{
+    struct dw_i2c *c = &g_i2c[1];
+    if (!c->slv || c->s_state != SS_RX || !slv_active(c)) return MM_I2C_SLV_NACK;
+    if ((c->regs[IC_SLV_DATA_NACK_ONLY / 4u] & 1u) != 0u) return MM_I2C_SLV_NACK;
+    if (c->s_rx_n >= 16u) {
+        if ((c->regs[IC_CON / 4u] & CON_RX_FIFO_FULL_HLD) != 0u) return MM_I2C_SLV_HOLD;
+        c->raw |= RAW_RX_OVER;
+        c->s_n_rx_over++;
+        return MM_I2C_SLV_ACK; /* acknowledged, and lost */
+    }
+    c->s_rxf[(c->s_rx_head + c->s_rx_n) & 15u] = (mm_u16)(byte | (c->s_first ? DATA_FIRST_BYTE : 0u));
+    c->s_rx_n++;
+    c->s_first = MM_FALSE;
+    c->s_rx_data = MM_TRUE;
+    c->s_n_rx++;
+    return MM_I2C_SLV_ACK;
+}
+
+int mm_rp2350_i2c1_bus_read(mm_u8 *byte)
+{
+    struct dw_i2c *c = &g_i2c[1];
+    if (!c->slv || c->s_state != SS_TX || !slv_active(c)) return MM_I2C_SLV_NACK;
+    if (c->s_tx_n == 0u) {
+        if (!c->s_rd_req) {
+            c->s_rd_req = MM_TRUE;
+            c->raw |= RAW_RD_REQ;
+            c->s_n_rd_req++;
+            SLV_TRACE("TX FIFO empty -> RD_REQ, SCL held");
+        }
+        return MM_I2C_SLV_HOLD;
+    }
+    *byte = c->s_txf[c->s_tx_head];
+    c->s_tx_head = (c->s_tx_head + 1u) & 15u;
+    c->s_tx_n--;
+    c->s_rd_req = MM_FALSE;
+    c->s_n_tx++;
+    return MM_I2C_SLV_ACK;
+}
+
+void mm_rp2350_i2c1_bus_master_ack(mm_bool ack)
+{
+    struct dw_i2c *c = &g_i2c[1];
+    if (!c->slv || c->s_state != SS_TX || ack) return;
+    c->raw |= RAW_RX_DONE;
+    c->s_n_rx_done++;
+    c->s_state = SS_TX_DONE;
+}
+
+void mm_rp2350_i2c1_bus_stop(void)
+{
+    struct dw_i2c *c = &g_i2c[1];
+    mm_u8 st = c->s_state;
+    if (!c->slv) return;
+    c->s_state = SS_IDLE;
+    c->s_rd_req = MM_FALSE;
+    if (st == SS_IDLE || st == SS_OFF || !slv_active(c)) return;
+    if ((c->regs[IC_CON / 4u] & CON_STOP_DET_IFADDR) == 0u || c->s_addressed) {
+        c->raw |= RAW_STOP_DET;
+        SLV_TRACE("P -> STOP_DET");
+    }
+    c->s_addressed = MM_FALSE;
+    c->s_n_stop++;
+}
+
+/* register side */
+
+static const char *slv_reg_name(mm_u32 off)
+{
+    switch (off) {
+    case IC_CON: return "IC_CON";
+    case IC_SAR: return "IC_SAR";
+    case IC_DATA_CMD: return "IC_DATA_CMD";
+    case IC_INTR_STAT: return "IC_INTR_STAT";
+    case IC_INTR_MASK: return "IC_INTR_MASK";
+    case IC_RAW_INTR_STAT: return "IC_RAW_INTR_STAT";
+    case IC_RX_TL: return "IC_RX_TL";
+    case IC_TX_TL: return "IC_TX_TL";
+    case IC_CLR_INTR: return "IC_CLR_INTR";
+    case IC_CLR_RD_REQ: return "IC_CLR_RD_REQ";
+    case IC_CLR_TX_ABRT: return "IC_CLR_TX_ABRT";
+    case IC_CLR_STOP_DET: return "IC_CLR_STOP_DET";
+    case IC_CLR_START_DET: return "IC_CLR_START_DET";
+    case IC_CLR_RESTART_DET: return "IC_CLR_RESTART_DET";
+    case IC_ENABLE: return "IC_ENABLE";
+    case IC_STATUS: return "IC_STATUS";
+    case IC_TXFLR: return "IC_TXFLR";
+    case IC_RXFLR: return "IC_RXFLR";
+    case IC_TX_ABRT_SOURCE: return "IC_TX_ABRT_SOURCE";
+    case IC_ENABLE_STATUS: return "IC_ENABLE_STATUS";
+    default: return "";
+    }
+}
+
+static mm_u32 slv_reg_read_inner(struct dw_i2c *c, mm_u32 off, mm_bool peek)
+{
+    switch (off) {
+    case IC_RAW_INTR_STAT: return slv_raw(c);
+    case IC_INTR_STAT: return slv_raw(c) & c->regs[IC_INTR_MASK / 4u];
+    case IC_TX_ABRT_SOURCE: return c->abrt_source | (c->s_flush_cnt << 23);
+    case IC_CLR_INTR:
+        if (!peek) {
+            c->raw &= RAW_RX_FULL | RAW_TX_EMPTY; /* hardware-cleared ones are levels anyway */
+            c->abrt_source = 0u;
+        }
+        return 0u;
+    case IC_CLR_RX_UNDER: if (!peek) c->raw &= ~RAW_RX_UNDER; return 0u;
+    case IC_CLR_RX_OVER: if (!peek) c->raw &= ~RAW_RX_OVER; return 0u;
+    case IC_CLR_TX_OVER: if (!peek) c->raw &= ~RAW_TX_OVER; return 0u;
+    case IC_CLR_RD_REQ: if (!peek) c->raw &= ~RAW_RD_REQ; return 0u;
+    case IC_CLR_TX_ABRT:
+        if (!peek) { c->raw &= ~RAW_TX_ABRT; c->abrt_source = 0u; }
+        return 0u;
+    case IC_CLR_RX_DONE: if (!peek) c->raw &= ~RAW_RX_DONE; return 0u;
+    case IC_CLR_ACTIVITY: if (!peek && !slv_busy(c)) c->raw &= ~RAW_ACTIVITY; return 0u;
+    case IC_CLR_STOP_DET: if (!peek) c->raw &= ~RAW_STOP_DET; return 0u;
+    case IC_CLR_START_DET: if (!peek) c->raw &= ~RAW_START_DET; return 0u;
+    case IC_CLR_GEN_CALL: if (!peek) c->raw &= ~RAW_GEN_CALL; return 0u;
+    case IC_CLR_RESTART_DET: if (!peek) c->raw &= ~RAW_RESTART_DET; return 0u;
+    case IC_STATUS:
+        return (slv_busy(c) ? ((1u << 0) | (1u << 6)) : 0u) |   /* ACTIVITY | SLV_ACTIVITY */
+               ((c->s_tx_n < 16u) ? (1u << 1) : 0u) |           /* TFNF */
+               ((c->s_tx_n == 0u) ? (1u << 2) : 0u) |           /* TFE */
+               ((c->s_rx_n != 0u) ? (1u << 3) : 0u) |           /* RFNE */
+               ((c->s_rx_n == 16u) ? (1u << 4) : 0u);           /* RFF */
+    case IC_TXFLR: return c->s_tx_n;
+    case IC_RXFLR: return c->s_rx_n;
+    case IC_DATA_CMD: {
+        mm_u32 v;
+        if (c->s_rx_n == 0u) {
+            if (!peek) { c->raw |= RAW_RX_UNDER; c->s_n_rx_under++; }
+            return 0u;
+        }
+        v = c->s_rxf[c->s_rx_head];
+        if (!peek) {
+            c->s_rx_head = (c->s_rx_head + 1u) & 15u;
+            c->s_rx_n--;
+        }
+        return v;
+    }
+    case IC_ENABLE_STATUS:
+        if ((c->regs[IC_ENABLE / 4u] & 1u) != 0u) return 1u;
+        return c->s_en_status;
+    case IC_COMP_PARAM_1: return 0x000f0fefu; /* 16-deep FIFOs */
+    case IC_COMP_VERSION: return 0x3230312au;
+    case IC_COMP_TYPE: return 0x44570140u;
+    default:
+        if (off >= 0x40u && off <= 0x68u) return 0u;
+        return c->regs[(off & 0xffu) / 4u];
+    }
+}
+
+static mm_u32 i2c_slv_reg_read(struct dw_i2c *c, mm_u32 off)
+{
+    mm_bool peek = mmio_peek_mode();
+    mm_u32 v;
+    if (mm_rp2350_reset_asserted(c->reset_bit)) return 0u;
+    if (!peek) mm_rp2350_i2c1_master_run(); /* the bus up to now */
+    v = slv_reg_read_inner(c, off, peek);
+    if (!peek) {
+        SLV_TRACE("rd +0x%02x %-18s -> 0x%08x", off, slv_reg_name(off), v);
+        if (off == IC_DATA_CMD) mm_rp2350_i2c1_master_run(); /* room in the RX FIFO: a held byte goes on now */
+    }
+    return v;
+}
+
+static void i2c_slv_reg_write(struct dw_i2c *c, mm_u32 off, mm_u32 v)
+{
+    mm_bool en;
+    if (mm_rp2350_reset_asserted(c->reset_bit)) return;
+    mm_rp2350_i2c1_master_run();
+    en = ((c->regs[IC_ENABLE / 4u] & 1u) != 0u) ? MM_TRUE : MM_FALSE;
+    SLV_TRACE("wr +0x%02x %-18s <- 0x%08x", off, slv_reg_name(off), v);
+    switch (off) {
+    case IC_DATA_CMD:
+        if (!en) return;
+        if ((c->regs[IC_CON / 4u] & CON_MASTER_MODE) != 0u) {
+            /* master mode: nobody else on this bus acknowledges, as before */
+            c->raw |= RAW_TX_ABRT | RAW_STOP_DET | RAW_START_DET;
+            c->abrt_source = 1u; /* ABRT_7B_ADDR_NOACK */
+            c->nacks++;
+            return;
+        }
+        if ((c->raw & RAW_TX_ABRT) != 0u) return; /* held flushed until IC_CLR_TX_ABRT */
+        if ((v & CMD_READ) != 0u) { slv_tx_abort(c, ABRT_SLVRD_INTX); return; }
+        if (c->s_tx_n >= 16u) {
+            c->raw |= RAW_TX_OVER;
+            c->s_n_tx_over++;
+            return;
+        }
+        c->s_txf[(c->s_tx_head + c->s_tx_n) & 15u] = (mm_u8)(v & 0xffu);
+        c->s_tx_n++;
+        mm_rp2350_i2c1_master_run(); /* a held read goes on now */
+        return;
+    case IC_ENABLE: {
+        mm_u32 old = c->regs[IC_ENABLE / 4u];
+        c->regs[IC_ENABLE / 4u] = v & 0x5u; /* ENABLE, TX_CMD_BLOCK; ABORT is master only */
+        if ((old & 1u) != 0u && (v & 1u) == 0u) {
+            if (slv_busy(c)) {
+                c->s_en_status = (1u << 1) | ((c->s_state == SS_RX && c->s_rx_data) ? (1u << 2) : 0u);
+                c->s_state = SS_OFF;
+                SLV_TRACE("disabled during a transfer: SLV_DISABLED_WHILE_BUSY%s",
+                          (c->s_en_status & 4u) ? ", SLV_RX_DATA_LOST" : "");
+            } else {
+                c->s_en_status = 0u;
+            }
+            slv_flush(c);
+            c->raw = 0u;
+            c->abrt_source = 0u;
+            c->s_flush_cnt = 0u;
+            c->s_rd_req = MM_FALSE;
+        } else if ((old & 1u) == 0u && (v & 1u) != 0u) {
+            c->s_en_status = 0u;
+        }
+        return;
+    }
+    case IC_CON:
+    case IC_SAR:
+    case IC_SS_SCL_HCNT:
+    case IC_SS_SCL_LCNT:
+    case IC_FS_SCL_HCNT:
+    case IC_FS_SCL_LCNT:
+    case IC_FS_SPKLEN:
+    case IC_SLV_DATA_NACK_ONLY:
+        if (en) {
+            c->s_n_locked++;
+            SLV_TRACE("wr +0x%02x ignored: IC_ENABLE = 1", off);
+            return;
+        }
+        if (off == IC_CON) v &= 0x3ffu;
+        else if (off == IC_SAR) v &= 0x3ffu;
+        else if (off == IC_FS_SPKLEN) { v &= 0xffu; if (v == 0u) v = 1u; }
+        else if (off == IC_SLV_DATA_NACK_ONLY) v &= 1u;
+        else v &= 0xffffu;
+        c->regs[off / 4u] = v;
+        return;
+    case IC_RX_TL:
+    case IC_TX_TL:
+        v &= 0xffu;
+        c->regs[off / 4u] = (v > 15u) ? 15u : v;
+        return;
+    case IC_INTR_MASK:
+        c->regs[off / 4u] = v & 0x1fffu;
+        return;
+    default:
+        if (off < 0x100u && !(off >= 0x40u && off <= 0x68u) && off != IC_CLR_RESTART_DET) c->regs[off / 4u] = v;
+        return;
+    }
+}
+
 void mm_rp2350_extra_i2c_reset(mm_u32 index)
 {
     struct dw_i2c *c = &g_i2c[index & 1u];
+    if (c->slv) { /* slave model */
+        slv_regs_reset(c);
+        SLV_TRACE("RESETS: block reset, registers at their reset values");
+        return;
+    }
     if (!c->dev) return; /* the empty-bus model keeps its registers, as before */
     i2c_eng_halt(c, MM_TRUE);
     memset(c->regs, 0, sizeof(c->regs));
@@ -471,6 +978,7 @@ void mm_rp2350_extra_i2c_reset(mm_u32 index)
 static mm_u32 i2c_reg_read(struct dw_i2c *c, mm_u32 off)
 {
     mm_u32 v;
+    if (c->slv) return i2c_slv_reg_read(c, off); /* slave mode, external master */
     if (c->dev) return i2c_eng_reg_read(c, off); /* slave model attached */
     switch (off) {
     case IC_RAW_INTR_STAT: return c->raw | RAW_TX_EMPTY;
@@ -505,6 +1013,7 @@ static mm_u32 i2c_reg_read(struct dw_i2c *c, mm_u32 off)
 
 static void i2c_reg_write(struct dw_i2c *c, mm_u32 off, mm_u32 v)
 {
+    if (c->slv) { i2c_slv_reg_write(c, off, v); return; } /* slave mode, external master */
     if (c->dev) { i2c_eng_reg_write(c, off, v); return; } /* slave model attached */
     if (off == IC_DATA_CMD) {
         if ((c->regs[IC_ENABLE / 4u] & 1u) != 0u && (c->regs[IC_CON / 4u] & 1u) != 0u) {
@@ -828,6 +1337,7 @@ static void rtt_drain(void)
         while (rd != wr) {
             mm_u32 end = (wr > rd) ? wr : size;
             fwrite(data + rd, 1, end - rd, g_rtt_out);
+            if (g_i2c_slv_on) mm_rp2350_i2c1_master_rtt(data + rd, end - rd); /* wait_log */
             rd = (end == size) ? 0u : end;
         }
         fflush(g_rtt_out);
@@ -1043,6 +1553,10 @@ void mm_rp2350_extra_tick(mm_u64 cycles)
         if (g_i2c[0].dev && g_i2c[0].phase != PH_IDLE) i2c_eng_run(&g_i2c[0]);
         if (g_i2c[1].dev && g_i2c[1].phase != PH_IDLE) i2c_eng_run(&g_i2c[1]);
     }
+    if (g_i2c_slv_on) { /* the scripted master on I2C1, and the IRQ line */
+        mm_rp2350_i2c1_master_run();
+        slv_update_irq(&g_i2c[1]);
+    }
     if (g_pcs_every) pc_sample(cycles);
     if (!g_rtt_enabled) return;
     g_rtt_cycles += cycles;
@@ -1098,6 +1612,17 @@ mm_bool mm_rp2350_extra_register(struct mmio_bus *bus)
         g_i2c[mm_rp2350_pcal6416_bus() & 1u].dev = MM_TRUE;
         g_i2c_dev_any = MM_TRUE;
     }
+    if (mm_rp2350_i2c1_master_enabled() && !g_i2c_slv_on) { /* I2C1 slave mode, external master */
+        if (g_i2c[1].dev) {
+            printf("[I2C] I2C1 already has the PCAL6416 model attached; M33MU_I2C1_MASTER ignored\n");
+        } else {
+            g_i2c[1].slv = MM_TRUE;
+            g_i2c[1].s_state = SS_IDLE;
+            slv_regs_reset(&g_i2c[1]);
+            g_i2c_slv_on = MM_TRUE;
+            printf("[I2C] I2C1: DW_apb_i2c slave mode model on, IRQ %u, bus driven by the scripted master\n", I2C1_IRQ);
+        }
+    }
     {
         const char *pcs = getenv("M33MU_PC_SAMPLE");
         const char *rtt = getenv("M33MU_RTT");
@@ -1150,6 +1675,18 @@ void mm_rp2350_extra_stats(void)
                     c->name, (unsigned long long)c->n_start, (unsigned long long)c->n_tx,
                     (unsigned long long)c->n_rx, (unsigned long long)c->n_stop, (unsigned long long)c->n_cut);
         }
+    }
+    if (g_i2c_slv_on) {
+        const struct dw_i2c *c = &g_i2c[1];
+        fprintf(stderr, "[I2C] I2C1 slave model: starts=%llu addressed=%llu other_addr=%llu bytes_rx=%llu bytes_tx=%llu "
+                        "rd_req=%llu rx_done=%llu stops=%llu irq_pend=%llu tx_abrt=%llu rx_over=%llu tx_over=%llu "
+                        "rx_under=%llu locked_writes=%llu\n",
+                (unsigned long long)c->s_n_start, (unsigned long long)c->s_n_match, (unsigned long long)c->s_n_other,
+                (unsigned long long)c->s_n_rx, (unsigned long long)c->s_n_tx, (unsigned long long)c->s_n_rd_req,
+                (unsigned long long)c->s_n_rx_done, (unsigned long long)c->s_n_stop, (unsigned long long)c->s_n_irq,
+                (unsigned long long)c->s_n_abrt, (unsigned long long)c->s_n_rx_over, (unsigned long long)c->s_n_tx_over,
+                (unsigned long long)c->s_n_rx_under, (unsigned long long)c->s_n_locked);
+        mm_rp2350_i2c1_master_stats();
     }
     if (g_probe.state > 0) {
         fprintf(stderr, "[PROBE] fn_enter=%llu fn_exit=%llu dma_pio=%llu\n", (unsigned long long)g_probe.n_enter,

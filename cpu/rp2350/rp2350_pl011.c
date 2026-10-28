@@ -540,6 +540,7 @@ static mm_bool rp2350_irq_level(mm_u32 irq)
 {
     if (irq == UART0_IRQ) return (g_uart[0].ris & g_uart[0].imsc) != 0u ? MM_TRUE : MM_FALSE;
     if (irq == UART1_IRQ) return (g_uart[1].ris & g_uart[1].imsc) != 0u ? MM_TRUE : MM_FALSE;
+    if (mm_rp2350_extra_i2c_line(irq)) return MM_TRUE; /* I2C1 slave model, off by default */
     return mm_rp2350_dma_line(irq);
 }
 
@@ -552,6 +553,7 @@ void mm_rp2350_uart_init(struct mmio_bus *bus, struct mm_nvic *nvic)
     mm_rp2350_usb_set_nvic(nvic);
     g_nvic = nvic;
     mm_rp2350_dma_set_nvic(nvic);
+    mm_rp2350_extra_set_nvic(nvic);
     mm_nvic_set_level_source(rp2350_irq_level);
     if (!atexit_done) { atexit_done = 1; atexit(pl011_atexit); signal(SIGTERM, pl011_sigterm); signal(SIGINT, pl011_sigterm); }
     if (clk != 0 && clk[0] != '\0') {

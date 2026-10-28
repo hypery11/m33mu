@@ -6155,6 +6155,14 @@ int main(int argc, char **argv)
                         mm_u64 delta =
                             mm_execution_state_cycles_until_wake(
                                 &execution, 0u, host_deadline);
+                        {
+                            /* also wake for the next bus event of the
+                             * I2C1 scripted master (M33MU_I2C1_MASTER), so its
+                             * IRQs are not held back to the next SysTick;
+                             * (mm_u64)-1, i.e. no change, when it is off */
+                            mm_u64 dev = mm_rp2350_extra_next_event();
+                            if (dev < delta) delta = dev != 0u ? dev : 1u;
+                        }
                         if (delta == (mm_u64)-1) {
                             mm_u64 idle_cycles = 0;
                             mm_u64 slept_ns = IDLE_SLEEP_NS;

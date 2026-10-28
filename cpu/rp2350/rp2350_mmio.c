@@ -137,8 +137,8 @@ extern void mm_system_request_reset(void);
 #define RP2350_BOOTROM_ERROR_BAD_ALIGNMENT ((mm_u32)0u - 11u)
 #define RP2350_BOOTROM_ERROR_UNSUPPORTED_MODIFICATION ((mm_u32)0u - 18u)
 
-#define RP2350_OTP_ROW_COUNT 0x800u
-#define RP2350_OTP_ROW_BYTES 32u
+#define RP2350_OTP_ROW_COUNT 0x1000u
+#define RP2350_OTP_ROW_BYTES 4u
 #define RP2350_OTP_SW_LOCK_COUNT 64u
 #define HSTX_FIFO_STAT 0x000u
 #define HSTX_FIFO_FIFO 0x004u
@@ -3151,107 +3151,127 @@ mm_bool mm_rp2350_flash_erase_all(void)
     return MM_TRUE;
 }
 
+/* OTP as the RP2350 has it: 4096 rows of 24 bits.  A row is kept in
+ * RP2350_OTP_ROW_BYTES of the backing store, bits inverted like the rest of
+ * mm_otp (erased = 0xff), so a row can only go from 0 to 1 bits.
+ * otp_access() then works row by row like the bootrom's: in ECC mode each
+ * 2 bytes of the buffer are one row, in raw mode each 4 bytes are one row
+ * (low 24 bits), and a write stops at the first row that would need a bit to
+ * go from 1 to 0, with UNSUPPORTED_MODIFICATION. */
+
+/* Stand-in for the 6 ECC bits the chip keeps in bits 21:16 of an ECC row.
+ * It is not the silicon's code; it only has to depend on the data so that a
+ * different value written over a used row usually needs a 1 to 0 change, as
+ * on the chip.  Bits 23:22 (bit repair by polarity) stay 0. */
+static mm_u32 rp2350_otp_ecc6(mm_u32 data16)
+{
+    mm_u32 p = 0u;
+    mm_u32 bit;
+    mm_u32 pos = 1u;
+    mm_u32 all = 0u;
+    for (bit = 0u; bit < 16u; ++bit) {
+        while ((pos & (pos - 1u)) == 0u) {
+            ++pos; /* skip parity positions 1, 2, 4, 8, 16 */
+        }
+        if ((data16 >> bit) & 1u) {
+            p ^= pos;
+            all ^= 1u;
+        }
+        ++pos;
+    }
+    {
+        mm_u32 i;
+        for (i = 0u; i < 5u; ++i) {
+            all ^= (p >> i) & 1u;
+        }
+    }
+    return (p & 0x1fu) | (all << 5);
+}
+
+static mm_bool rp2350_otp_row_get(mm_u32 row, mm_u32 *raw)
+{
+    mm_u8 b[RP2350_OTP_ROW_BYTES];
+    if (!mm_otp_read(&otp_state.otp, row * RP2350_OTP_ROW_BYTES, b, (mm_u32)sizeof(b))) {
+        return MM_FALSE;
+    }
+    *raw = (mm_u32)(mm_u8)~b[0] | ((mm_u32)(mm_u8)~b[1] << 8) | ((mm_u32)(mm_u8)~b[2] << 16);
+    return MM_TRUE;
+}
+
+static mm_u32 rp2350_otp_row_program(mm_u32 row, mm_u32 raw)
+{
+    mm_u32 old = 0u;
+    mm_u8 b[RP2350_OTP_ROW_BYTES];
+    raw &= 0x00ffffffu;
+    if (!rp2350_otp_row_get(row, &old)) return RP2350_BOOTROM_ERROR_INVALID_ARG;
+    if ((old & ~raw) != 0u) return RP2350_BOOTROM_ERROR_UNSUPPORTED_MODIFICATION;
+    b[0] = (mm_u8)~raw;
+    b[1] = (mm_u8)~(raw >> 8);
+    b[2] = (mm_u8)~(raw >> 16);
+    b[3] = 0xffu;
+    if (!mm_otp_write(&otp_state.otp, row * RP2350_OTP_ROW_BYTES, b, (mm_u32)sizeof(b))) {
+        return RP2350_BOOTROM_ERROR_UNSUPPORTED_MODIFICATION;
+    }
+    return 0u;
+}
+
+static mm_u32 rp2350_otp_row_permission(enum mm_sec_state sec, mm_u32 row, mm_bool write)
+{
+    mm_u32 page = row / 0x40u;
+    mm_u32 lock;
+    mm_u32 lock_mode;
+    if (page >= RP2350_OTP_SW_LOCK_COUNT) return 0u;
+    lock = otp_state.sw_lock[page];
+    lock_mode = (sec == MM_SECURE) ? (lock & 0x3u) : ((lock >> 2) & 0x3u);
+    if (lock_mode == 3u) return RP2350_BOOTROM_ERROR_NOT_PERMITTED;
+    if (write && lock_mode != 0u) return RP2350_BOOTROM_ERROR_NOT_PERMITTED;
+    return 0u;
+}
+
 mm_u32 mm_rp2350_otp_access(enum mm_sec_state sec,
                             mm_u32 flags,
                             mm_u8 *data,
                             mm_u32 len)
 {
-    mm_u32 row = flags & RP2350_OTP_CMD_ROW_BITS;
-    mm_u32 page = row / 0x40u;
+    mm_u32 row0 = flags & RP2350_OTP_CMD_ROW_BITS;
     mm_bool write = (flags & RP2350_OTP_CMD_WRITE_BITS) != 0u;
     mm_bool ecc = (flags & RP2350_OTP_CMD_ECC_BITS) != 0u;
-    mm_u8 *row_data;
-    mm_u8 *otp_data;
+    mm_u32 step = ecc ? 2u : 4u;
+    mm_u32 rows;
     mm_u32 i;
-    mm_u32 lock = 0u;
-    mm_u32 lock_mode = 0u;
-    mm_bool row_empty = MM_FALSE;
 
     if (data == 0 || len == 0u) return RP2350_BOOTROM_ERROR_INVALID_ARG;
-    if (row >= RP2350_OTP_ROW_COUNT) return RP2350_BOOTROM_ERROR_INVALID_ARG;
-    if (page < RP2350_OTP_SW_LOCK_COUNT) {
-        lock = otp_state.sw_lock[page];
-        if (sec == MM_SECURE) {
-            lock_mode = lock & 0x3u;
-        } else {
-            lock_mode = (lock >> 2) & 0x3u;
-        }
-        if (lock_mode == 3u) {
-            return RP2350_BOOTROM_ERROR_NOT_PERMITTED;
-        }
-        if (write && lock_mode != 0u) {
-            return RP2350_BOOTROM_ERROR_NOT_PERMITTED;
-        }
+    if ((len % step) != 0u) return RP2350_BOOTROM_ERROR_BAD_ALIGNMENT;
+    rows = len / step;
+    if (row0 >= RP2350_OTP_ROW_COUNT || rows > RP2350_OTP_ROW_COUNT - row0) {
+        return RP2350_BOOTROM_ERROR_INVALID_ARG;
     }
-    otp_data = mm_otp_data(&otp_state.otp);
-    if (otp_data == 0) return RP2350_BOOTROM_ERROR_INVALID_ARG;
-    row_data = otp_data + (row * RP2350_OTP_ROW_BYTES);
-    row_empty = MM_TRUE;
-    for (i = 0; i < RP2350_OTP_ROW_BYTES; ++i) {
-        if (row_data[i] != 0xffu) {
-            row_empty = MM_FALSE;
-            break;
-        }
-    }
-    if (ecc) {
-        if ((len & 1u) != 0u) return RP2350_BOOTROM_ERROR_BAD_ALIGNMENT;
-        if (len > RP2350_OTP_ROW_BYTES) return RP2350_BOOTROM_ERROR_INVALID_ARG;
+
+    for (i = 0u; i < rows; ++i) {
+        mm_u32 row = row0 + i;
+        mm_u8 *p = data + i * step;
+        mm_u32 raw = 0u;
+        mm_u32 rc = rp2350_otp_row_permission(sec, row, write);
+        if (rc != 0u) return rc;
         if (write) {
-            mm_u8 tmp[RP2350_OTP_ROW_BYTES];
-            for (i = 0; i < len; ++i) {
-                tmp[i] = (mm_u8)(~data[i]);
+            if (ecc) {
+                mm_u32 d = (mm_u32)p[0] | ((mm_u32)p[1] << 8);
+                raw = d | (rp2350_otp_ecc6(d) << 16);
+            } else {
+                raw = (mm_u32)p[0] | ((mm_u32)p[1] << 8) | ((mm_u32)p[2] << 16);
             }
-            if (!mm_otp_write(&otp_state.otp, row * RP2350_OTP_ROW_BYTES, tmp, len)) {
-                return RP2350_BOOTROM_ERROR_UNSUPPORTED_MODIFICATION;
-            }
-            return 0u;
-        }
-        if (row_empty) {
-            memset(data, 0, len);
-            return 0u;
-        }
-        if (!mm_otp_read(&otp_state.otp, row * RP2350_OTP_ROW_BYTES, data, len)) {
-            return RP2350_BOOTROM_ERROR_INVALID_ARG;
-        }
-        for (i = 0; i < len; ++i) {
-            data[i] = (mm_u8)(~data[i]);
-        }
-        return 0u;
-    }
-
-    if ((len & 3u) != 0u) return RP2350_BOOTROM_ERROR_BAD_ALIGNMENT;
-    if ((len / 4u) * 3u > RP2350_OTP_ROW_BYTES) return RP2350_BOOTROM_ERROR_INVALID_ARG;
-    if (write) {
-        mm_u32 word_count = len / 4u;
-        for (i = 0; i < word_count; ++i) {
-            mm_u32 base = i * 4u;
-            mm_u32 store = i * 3u;
-            mm_u8 b0 = data[base + 0u];
-            mm_u8 b1 = data[base + 1u];
-            mm_u8 b2 = data[base + 2u];
-            mm_u8 tmp[3];
-            tmp[0] = (mm_u8)(~b0);
-            tmp[1] = (mm_u8)(~b1);
-            tmp[2] = (mm_u8)(~b2);
-            if (!mm_otp_write(&otp_state.otp, (row * RP2350_OTP_ROW_BYTES) + store, tmp, 3u)) {
-                return RP2350_BOOTROM_ERROR_UNSUPPORTED_MODIFICATION;
-            }
-        }
-        return 0u;
-    }
-
-    {
-        mm_u32 word_count = len / 4u;
-        if (row_empty) {
-            memset(data, 0, len);
+            rc = rp2350_otp_row_program(row, raw);
+            if (rc != 0u) return rc;
         } else {
-            for (i = 0; i < word_count; ++i) {
-                mm_u32 base = i * 4u;
-                mm_u32 store = i * 3u;
-                data[base + 0u] = (mm_u8)(~row_data[store + 0u]);
-                data[base + 1u] = (mm_u8)(~row_data[store + 1u]);
-                data[base + 2u] = (mm_u8)(~row_data[store + 2u]);
-                data[base + 3u] = 0u;
+            if (!rp2350_otp_row_get(row, &raw)) return RP2350_BOOTROM_ERROR_INVALID_ARG;
+            if (ecc) {
+                p[0] = (mm_u8)(raw & 0xffu);
+                p[1] = (mm_u8)((raw >> 8) & 0xffu);
+            } else {
+                p[0] = (mm_u8)(raw & 0xffu);
+                p[1] = (mm_u8)((raw >> 8) & 0xffu);
+                p[2] = (mm_u8)((raw >> 16) & 0xffu);
+                p[3] = 0u;
             }
         }
     }
@@ -3260,7 +3280,11 @@ mm_u32 mm_rp2350_otp_access(enum mm_sec_state sec,
 
 void mm_rp2350_otp_init(const char *target_name)
 {
+    const char *path = getenv("M33MU_OTP_FILE");
     mm_otp_init(&otp_state.otp, target_name, RP2350_OTP_ROW_COUNT * RP2350_OTP_ROW_BYTES);
+    if (path != 0 && path[0] != '\0') {
+        snprintf(otp_state.otp.path, sizeof(otp_state.otp.path), "%s", path);
+    }
 }
 
 mm_u32 mm_rp2350_flash_size(void)

@@ -453,6 +453,7 @@ mm_bool mm_execution_state_init_core_system(
         return MM_FALSE;
     }
     memset(&state->scs_mux, 0, sizeof(state->scs_mux));
+    mm_decode_set_mve((state->target.flags & MM_TARGET_FLAG_MVE) != 0u);
     for (i = 0u; i < state->target.core_count; ++i) {
         mm_scs_init(&state->cores[i].scs, cpuid);
         mm_scs_set_fpu_present(

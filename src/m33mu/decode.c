@@ -764,6 +764,13 @@ static struct mm_decoded decode_16(mm_u16 hw1)
  *                   Vm = ((insn>>0)&0xf)<<1  | ((insn>>5)&1)
  *   load/store   Vd = (((insn>>12)&0xf) | (((insn>>22)&1)<<4)) >> 1, Rn = (insn>>16)&0xf
  * Returns MM_OP_UNDEFINED when the word is not an MVE instruction. */
+static mm_bool g_decode_mve = MM_FALSE;
+
+void mm_decode_set_mve(mm_bool on)
+{
+    g_decode_mve = on;
+}
+
 static struct mm_decoded decode_mve(mm_u32 insn)
 {
     struct mm_decoded d;
@@ -893,10 +900,15 @@ static struct mm_decoded decode_32(mm_u32 insn)
     d.len = 4;
     d.raw = insn;
 
-    /* MVE (Helium) instructions - checked first, they live in the 1111 space. */
-    d = decode_mve(insn);
-    if (d.kind != MM_OP_UNDEFINED) {
-        return d;
+    /* MVE (Helium) instructions - checked first, they live in the 1111 space.
+     * Only on cores with MVE: several of the patterns also match scalar VFP
+     * encodings (VCVT between f32 and s32/u32, VADD/VSUB/VMUL.F32,
+     * VCMPE.F32 #0), which must keep working on the S registers. */
+    if (g_decode_mve) {
+        d = decode_mve(insn);
+        if (d.kind != MM_OP_UNDEFINED) {
+            return d;
+        }
     }
 
 

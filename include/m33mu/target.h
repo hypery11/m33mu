@@ -148,5 +148,8 @@ struct mm_target_cfg {
  * off (i.MX RT700): images linked at the non-secure aliases still run Secure,
  * so neither --no-tz nor the non-secure-stack heuristic demotes the core. */
 #define MM_TARGET_FLAG_SECURE_BOOT (1u << 5)
+/* The core implements MVE (Cortex-M55): the decoder takes the MVE encodings
+ * it knows. Elsewhere those words are scalar VFP instructions. */
+#define MM_TARGET_FLAG_MVE (1u << 6)
 
 #endif /* M33MU_TARGET_H */

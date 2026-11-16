@@ -429,5 +429,7 @@ struct mm_fetch_result;
 
 /* Decode a fetched T32 instruction into a structured representation. */
 struct mm_decoded mm_decode_t32(const struct mm_fetch_result *fetch);
+/* Decode the MVE subset (MM_OP_MVE_*); off by default. */
+void mm_decode_set_mve(mm_bool on);
 
 #endif /* M33MU_DECODE_H */

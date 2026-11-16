@@ -73,6 +73,6 @@ mm_bool mm_stm32n657_mpcbb_block_secure(int bank, mm_u32 block_index);
 #define STM32N657_SPI_POLL       mm_stm32n657_spi_poll
 
 /* FPU + Helium (MVE). No write-once NVM: code lives in FLEXRAM (RAM). */
-#define STM32N657_FLAGS (MM_TARGET_FLAG_FPU)
+#define STM32N657_FLAGS (MM_TARGET_FLAG_FPU | MM_TARGET_FLAG_MVE)
 
 #endif /* M33MU_CPU_STM32N657_CONFIG_H */

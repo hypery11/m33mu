@@ -120,6 +120,9 @@ RESULT line=7 write_read 69 03 10 : 8 -> OK read: 11 11 03 16 22 22 00 00
 
 An image that keeps the two writes apart reads `11 11 00 00 00 00 22 22`.
 
+[scripts/flipper-one](../scripts/flipper-one/README.md) has the scripts used
+for #263 and #284, a runner and a checker.
+
 ## Not modelled
 
 - Time is emulated time. Durations in the logs are not board timings.

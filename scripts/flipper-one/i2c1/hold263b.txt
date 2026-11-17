@@ -1,0 +1,23 @@
+# I2C1 scripted master: short transactions while the I2C1 IRQ is held off (#263).
+# (hold263b: a 2 ms gap before each hold, so the previous STOP is handled first)
+# irq_hold_us stands in for a firmware critical section (flash/NVM write); the slave block keeps
+# ACKing written bytes into its RX FIFO meanwhile.
+wait_log enabling I2C slave mode
+delay_ms 50
+write_read 69 03 10 : 8            # line 6: LED colour registers 0x0310..0x0317 before (00 x8)
+# case 1: two register writes inside the hold
+delay_ms 2                         # the STOP of line 6 is handled before the hold
+irq_hold_us 3000
+write 69 03 10 11 11               # line 9:  0x0310 := 0x1111
+write 69 03 16 22 22               # line 10: 0x0316 := 0x2222
+delay_ms 10
+write_read 69 03 10 : 8            # line 12: want 11 11 00 00 00 00 22 22
+write_read 69 00 80 : 2            # line 13: version, want 01 00
+# case 2: a register write, then a read, inside the hold
+delay_ms 2
+irq_hold_us 3000
+write 69 03 12 33 33               # line 16: 0x0312 := 0x3333
+write_read 69 00 80 : 2            # line 17: version, want 01 00
+delay_ms 10
+write_read 69 03 10 : 8            # line 19: want 11 11 33 33 xx xx 22 22 (0x0314 as case 1 left it)
+write_read 69 00 80 : 2            # line 20: version, want 01 00

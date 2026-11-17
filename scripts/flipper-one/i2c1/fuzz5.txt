@@ -1,0 +1,128 @@
+# hold_fuzz seed=5 transactions=80
+wait_log enabling I2C slave mode
+delay_ms 50
+write 69 03 10
+read 69 6   # expect: 00 00 00 00 00 00
+write 69 03 12 39 be
+write 69 03 10 7f 06 6e d0 8f 5d c7 51
+write 69 03 14 e3 40 43 00
+write 69 03 10 54 55 94 a0
+write_read 69 00 80 : 2   # expect: 01 00
+write 69 03 10
+read 69 4   # expect: 54 55 94 a0
+write 69 03 12
+read 69 4   # expect: 94 a0 e3 40
+irq_hold_us 1579
+write_read 69 03 10 : 4   # expect: 54 55 94 a0
+irq_hold_us 1459
+write 69 03 14 21 9e
+delay_us 156
+write_read 69 03 10 : 6   # expect: 54 55 94 a0 21 9e
+write 69 03 10
+read 69 4   # expect: 54 55 94 a0
+irq_hold_us 193
+write 69 03 12
+read 69 6   # expect: 94 a0 21 9e 43 00
+irq_hold_us 1815
+write 69 03 10 e7 17 5c 64 3c 7d ec b0
+write_read 69 00 80 : 2   # expect: 01 00
+irq_hold_us 1995
+write 69 03 12 12 dd 2e 6a ae b9
+write 69 03 10 9f a2 9c 5a 28 4c
+write 69 03 10 18 29 cf 10 79 b0 80 e9
+write 69 03 10 fc ab
+write 69 03 14 d3 36 56 de
+delay_us 30
+write_read 69 03 10 : 6   # expect: fc ab cf 10 d3 36
+write_read 69 00 80 : 2   # expect: 01 00
+write_read 69 00 80 : 2   # expect: 01 00
+write_read 69 03 12 : 6   # expect: cf 10 d3 36 56 de
+irq_hold_us 2025
+write_read 69 03 10 : 4   # expect: fc ab cf 10
+delay_us 272
+write 69 03 10 5c 2d fb 8b b8 20 b6 11
+write 69 03 12 87 96 ae 5b 05 f2
+write 69 03 12 ed 93 b6 b2 8c b0
+write_read 69 03 10 : 6   # expect: 5c 2d ed 93 b6 b2
+write 69 03 10
+read 69 8   # expect: 5c 2d ed 93 b6 b2 8c b0
+write_read 69 00 80 : 2   # expect: 01 00
+irq_hold_us 780
+write 69 03 12 90 28 d5 57 d7 9a
+write 69 03 10
+read 69 6   # expect: 5c 2d 90 28 d5 57
+irq_hold_us 2502
+write_read 69 03 10 : 4   # expect: 5c 2d 90 28
+write 69 03 16 73 54
+irq_hold_us 646
+write 69 03 10 f7 63 12 d4 ee b3
+delay_us 36
+write_read 69 00 80 : 2   # expect: 01 00
+irq_hold_us 1631
+write 69 03 12 8e d1 3a bf 12 9a
+irq_hold_us 2333
+write_read 69 00 80 : 2   # expect: 01 00
+delay_us 297
+write 69 03 10 d6 d1 bd ef 48 50
+write_read 69 00 80 : 2   # expect: 01 00
+write 69 03 14 2e b3 00 c3
+irq_hold_us 2417
+write_read 69 00 80 : 2   # expect: 01 00
+write 69 03 10 dd 73 fc 95 f5 c2 c4 51
+write 69 03 12 80 d4 0a a3 9d fb
+write 69 03 10 3e e3 7d 96 14 45 c8 06
+write_read 69 00 80 : 2   # expect: 01 00
+irq_hold_us 2042
+write 69 03 12 89 4f 92 96
+write_read 69 03 10 : 2   # expect: 3e e3
+write 69 03 12 97 0d ed b3 b8 43
+irq_hold_us 1133
+write_read 69 00 80 : 2   # expect: 01 00
+write 69 03 10 db da f6 c5
+write 69 03 12
+read 69 4   # expect: f6 c5 ed b3
+write 69 03 10 dd 92 f1 9f 49 54
+write_read 69 00 80 : 2   # expect: 01 00
+write 69 03 12 18 23 75 88
+write 69 03 14 db 23
+write 69 03 10
+read 69 8   # expect: dd 92 18 23 db 23 b8 43
+irq_hold_us 601
+write 69 03 12 95 e0
+irq_hold_us 2601
+write 69 03 10 22 6d 16 37 c2 24 8f 1d
+write 69 03 10 05 dd 2e a1 fa fa b4 bf
+write 69 03 10 94 70 86 20 78 82
+write 69 03 10 be e8 c7 5b
+irq_hold_us 176
+write 69 03 10
+read 69 6   # expect: be e8 c7 5b 78 82
+write 69 03 10 e8 7a
+delay_us 236
+write_read 69 03 10 : 6   # expect: e8 7a c7 5b 78 82
+write 69 03 10 4d db 72 3b 2a fb 6c 47
+write_read 69 03 10 : 6   # expect: 4d db 72 3b 2a fb
+irq_hold_us 2613
+write 69 03 12
+read 69 6   # expect: 72 3b 2a fb 6c 47
+delay_us 183
+write 69 03 12
+read 69 6   # expect: 72 3b 2a fb 6c 47
+write 69 03 12 5c ca
+irq_hold_us 251
+write 69 03 10 64 14 fa f6
+write 69 03 16 f0 99
+write_read 69 00 80 : 2   # expect: 01 00
+write 69 03 10 33 62 4f 51 24 bf c5 f0
+irq_hold_us 1140
+write 69 03 10 92 78 10 f6 10 b0
+write 69 03 10 0b e9 f1 4f 3c a6
+irq_hold_us 2862
+write 69 03 10 66 0c 76 28
+write 69 03 12
+read 69 6   # expect: 76 28 3c a6 c5 f0
+irq_hold_us 1580
+write 69 03 16 53 7b
+delay_ms 10
+write_read 69 03 10 : 8   # expect: 66 0c 76 28 3c a6 53 7b
+write_read 69 00 80 : 2   # expect: 01 00

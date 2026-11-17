@@ -1,0 +1,33 @@
+# I2C1 scripted master: more #263 cases (IRQ held off by irq_hold_us).
+wait_log enabling I2C slave mode
+delay_ms 50
+# case 3: a short write, then a long one; the hold ends in the middle of the long one
+delay_ms 2
+irq_hold_us 250
+write 69 03 16 44 44               # 0x0316 := 0x4444
+write 69 03 10 a1 a2 b1 b2 c1 c2   # 0x0310..0x0315, hold over after about three of its bytes
+delay_ms 10
+write_read 69 03 10 : 8            # want a1 a2 b1 b2 c1 c2 44 44
+# case 4: five writes, 20 bytes, more than the 16-entry RX FIFO
+delay_ms 2
+irq_hold_us 2000
+write 69 03 10 01 01
+write 69 03 12 02 02
+write 69 03 14 03 03
+write 69 03 16 04 04
+write 69 03 10 05 05
+delay_ms 10
+write_read 69 03 10 : 8            # want 05 05 02 02 03 03 04 04
+# case 5: a register pointer on its own, then a plain read
+delay_ms 2
+irq_hold_us 2000
+write 69 00 80
+read 69 2                          # want 01 00
+delay_ms 10
+# case 6: a write, then a longer read
+delay_ms 2
+irq_hold_us 2000
+write 69 03 12 55 55
+write_read 69 03 10 : 8            # want 05 05 55 55 03 03 04 04
+delay_ms 10
+write_read 69 00 80 : 2            # want 01 00

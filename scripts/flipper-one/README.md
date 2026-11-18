@@ -65,7 +65,9 @@ reason.
 
 For a write and a read in one transfer, `hold_fuzz.py` expects the bytes after
 the written ones (plain auto-increment). Where the firmware answers such a
-read from the register pointer instead, the read counts as wrong.
+read from the register pointer instead, the read counts as wrong. Since #284
+it always does, as on the chip: `classify_reads.py` lists those reads as
+`pointer`.
 
 These are emulator runs. See "Not modelled" in the doc for what the I2C1
 model leaves out.

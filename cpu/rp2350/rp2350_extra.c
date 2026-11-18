@@ -199,6 +199,7 @@ struct dw_i2c {
     mm_u32 s_rx_head, s_rx_n;
     mm_u8 s_state;           /* SS_* */
     mm_bool s_repeated;      /* the START being decoded is a repeated START */
+    mm_bool s_restart_det;   /* RESTART_DET was raised at that repeated START */
     mm_bool s_addressed;     /* our address was seen since the last START */
     mm_bool s_first;         /* the next byte received is the first after the address */
     mm_bool s_rx_data;       /* a data byte was received in this write */
@@ -506,8 +507,10 @@ static void i2c_eng_reg_write(struct dw_i2c *c, mm_u32 off, mm_u32 v)
  *              TX_OVER, TX_EMPTY (level: IC_TXFLR <= IC_TX_TL; TX_EMPTY_CTRL
  *              is not looked at), RD_REQ, TX_ABRT, RX_DONE, ACTIVITY,
  *              STOP_DET (honours STOP_DET_IFADDRESSED), START_DET (START and
- *              repeated START, any address), RESTART_DET (repeated START
- *              followed by our address); their IC_CLR_* read-to-clear
+ *              repeated START, any address), RESTART_DET (repeated START:
+ *              with START_DET when our address was seen earlier in the
+ *              transfer, as on the chip, otherwise once our address
+ *              follows); their IC_CLR_* read-to-clear
  *              registers and IC_CLR_INTR.  IC_INTR_STAT = raw & IC_INTR_MASK;
  *              its OR is the level of I2C1_IRQ (37) to the NVIC.
  *   registers  datasheet reset values, also after every RESETS cycle;
@@ -676,14 +679,20 @@ void mm_rp2350_i2c1_bus_start(mm_bool repeated)
     c->raw |= RAW_START_DET | RAW_ACTIVITY;
     c->s_repeated = repeated;
     if (!repeated) c->s_addressed = MM_FALSE;
+    /* A repeated START in a transfer that already addressed us raises
+     * RESTART_DET together with START_DET, before the address byte: that is
+     * what the chip does (traced on the RP2350, mcu-firmware#284). */
+    c->s_restart_det = (repeated && c->s_addressed) ? MM_TRUE : MM_FALSE;
+    if (c->s_restart_det) c->raw |= RAW_RESTART_DET;
     c->s_rd_req = MM_FALSE;
     c->s_state = SS_ADDR;
-    SLV_TRACE("%s -> START_DET", repeated ? "Sr" : "S");
+    SLV_TRACE("%s -> START_DET%s", repeated ? "Sr" : "S", c->s_restart_det ? ", RESTART_DET" : "");
 }
 
 int mm_rp2350_i2c1_bus_addr(mm_u32 addr7, mm_bool read)
 {
     struct dw_i2c *c = &g_i2c[1];
+    mm_bool restart_now;
     if (!c->slv || c->s_state != SS_ADDR) return MM_I2C_SLV_NACK;
     if (!slv_active(c)) {
         c->s_state = SS_OFF;
@@ -697,7 +706,10 @@ int mm_rp2350_i2c1_bus_addr(mm_u32 addr7, mm_bool read)
     }
     c->s_n_match++;
     c->s_addressed = MM_TRUE;
-    if (c->s_repeated) c->raw |= RAW_RESTART_DET;
+    /* After a transfer to another address the chip was not traced: keep
+     * RESTART_DET at our address there. */
+    restart_now = (c->s_repeated && !c->s_restart_det) ? MM_TRUE : MM_FALSE;
+    if (restart_now) c->raw |= RAW_RESTART_DET;
     if (read) {
         if (c->s_tx_n != 0u) slv_tx_abort(c, ABRT_SLVFLUSH_TXFIFO);
         c->s_state = SS_TX;
@@ -706,7 +718,7 @@ int mm_rp2350_i2c1_bus_addr(mm_u32 addr7, mm_bool read)
         c->s_first = MM_TRUE;
         c->s_rx_data = MM_FALSE;
     }
-    SLV_TRACE("address 0x%02x%c: ACK%s", addr7, read ? 'R' : 'W', c->s_repeated ? ", RESTART_DET" : "");
+    SLV_TRACE("address 0x%02x%c: ACK%s", addr7, read ? 'R' : 'W', restart_now ? ", RESTART_DET" : "");
     return MM_I2C_SLV_ACK;
 }
 

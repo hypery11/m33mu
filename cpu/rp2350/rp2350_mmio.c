@@ -1126,7 +1126,7 @@ static mm_bool watchdog_read(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm_
 {
     struct bank_regs *b = (struct bank_regs *)opaque;
     if (b == 0 || value_out == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
-    if ((offset + size_bytes) > WATCHDOG_SIZE) return MM_FALSE;
+    /* bank_read takes the XOR/SET/CLR aliases at 0x1000..0x3fff too. */
     return bank_read(b, offset, size_bytes, value_out);
 }
 
@@ -1134,20 +1134,33 @@ static mm_bool watchdog_write(void *opaque, mm_u32 offset, mm_u32 size_bytes, mm
 {
     struct bank_regs *b = (struct bank_regs *)opaque;
     mm_u32 reg;
+    mm_u32 alias;
+    mm_u32 base_off;
+    mm_u32 mask;
     if (b == 0 || size_bytes == 0u || size_bytes > 4u) return MM_FALSE;
-    if ((offset + size_bytes) > WATCHDOG_SIZE) return MM_FALSE;
-    if (offset == WATCHDOG_REASON) {
+    if ((offset + size_bytes) > MMIO_ALIAS_SIZE) return MM_FALSE;
+    /* The XOR/SET/CLR aliases as for the other banks: the SDK sets the
+     * PAUSE_DBG bits with hw_set_bits(&watchdog_hw->ctrl, ..). */
+    base_off = alias_base_offset(offset, &alias);
+    if ((base_off + size_bytes) > WATCHDOG_SIZE) return MM_FALSE;
+    if (base_off == WATCHDOG_REASON) {
         return MM_TRUE;
     }
-    if (offset == WATCHDOG_CTRL) {
-        reg = b->regs[offset / 4u];
-        reg = apply_write(reg, offset & 3u, size_bytes, value);
+    if (base_off == WATCHDOG_CTRL) {
+        reg = b->regs[base_off / 4u];
+        mask = alias_value(base_off & 3u, size_bytes, value);
+        switch (alias) {
+        case 1u: reg ^= mask; break;
+        case 2u: reg |= mask; break;
+        case 3u: reg &= ~mask; break;
+        default: reg = apply_write(reg, base_off & 3u, size_bytes, value); break;
+        }
         if ((reg & (1u << WATCHDOG_CTRL_TRIGGER_BIT)) != 0u) {
             rp2350_watchdog_reason_pending = WATCHDOG_REASON_FORCE;
             mm_system_request_reset();
             reg &= ~(1u << WATCHDOG_CTRL_TRIGGER_BIT);
         }
-        b->regs[offset / 4u] = reg;
+        b->regs[base_off / 4u] = reg;
         return MM_TRUE;
     }
     return bank_write(b, offset, size_bytes, value);
